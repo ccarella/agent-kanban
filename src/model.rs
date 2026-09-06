@@ -93,6 +93,19 @@ impl Card {
         self.updated_at = now_iso8601();
     }
 
+    pub fn log(&mut self, kind: impl Into<String>, message: impl Into<String>) {
+        self.agent_log.push(AgentLogEntry {
+            at: now_iso8601(),
+            kind: kind.into(),
+            message: crate::dispatch::truncate_log(message.into()),
+        });
+        self.touch();
+    }
+
+    pub fn last_log(&self) -> Option<&AgentLogEntry> {
+        self.agent_log.last()
+    }
+
     pub fn rev_badge(&self) -> Option<String> {
         if self.revision_count > 0 {
             Some(format!("rev {}", self.revision_count))
@@ -179,6 +192,16 @@ mod tests {
         assert!(card.agent_log.is_empty());
         assert!(card.rev_badge().is_none());
         assert!(!card.created_at.is_empty());
+    }
+
+    #[test]
+    fn log_appends_and_touches() {
+        let mut card = Card::new("Work");
+        let before = card.updated_at.clone();
+        card.log("success", "did it");
+        assert_eq!(card.agent_log.len(), 1);
+        assert_eq!(card.last_log().unwrap().kind, "success");
+        assert!(card.updated_at >= before);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, EditorField, EditorState, InlineTitle, Mode};
+use crate::app::{line_col, App, EditorCommit, EditorField, EditorState, InlineTitle, Mode};
 use crate::model::{Card, Status};
 
 const TITLE_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
@@ -22,6 +22,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match &app.mode {
         Mode::Help => draw_help(frame, area),
         Mode::InlineTitle(state) => draw_inline_title(frame, area, state),
+        Mode::ReviewPrompt { card_id } => draw_review_prompt(frame, area, app, card_id),
         Mode::Board | Mode::Editor(_) => {}
     }
 }
@@ -47,7 +48,14 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let path = app.board_path.display().to_string();
     let header = Line::from(vec![
         Span::styled(" Agent Kanban ", TITLE_STYLE),
-        Span::styled("M1 · v0.2", Style::new().fg(Color::DarkGray)),
+        Span::styled(
+            if app.dispatch_config.stub {
+                "M2 · v0.2 · stub"
+            } else {
+                "M2 · v0.2"
+            },
+            Style::new().fg(Color::DarkGray),
+        ),
         Span::raw("  "),
         Span::styled(path, Style::new().fg(Color::DarkGray)),
     ]);
@@ -176,7 +184,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect) {
-    let hints = " j/k select  h/l move  n capture  Enter edit  ? help  q quit ";
+    let hints = " j/k select  h/l move  n capture  Enter edit  r review  ? help  q quit ";
     frame.render_widget(
         Paragraph::new(hints)
             .style(Style::new().fg(Color::DarkGray))
@@ -196,11 +204,11 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(area, 74, 20);
+    let popup = centered(area, 76, 24);
     frame.render_widget(Clear, popup);
     let text = vec![
         Line::from(Span::styled(
-            "Keyboard (M1 board shell)",
+            "Keyboard (M2 dispatcher + Review)",
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -209,11 +217,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  l / →                  move focused card one column right"),
         Line::from("  n                      inline title → new card in Capture"),
         Line::from("  Enter                  full-screen body editor"),
+        Line::from("  r                      Review: accept → Done, or revise → To Do"),
         Line::from("  q                      quit (auto-save ./board.json)"),
         Line::from("  ?                      this help"),
         Line::from(""),
-        Line::from("  M1 is the board shell only. No agent. Persist: ./board.json"),
-        Line::from("  Esc or ? closes this overlay."),
+        Line::from("  Dispatcher picks one To Do card (in-process interval; no cron)."),
+        Line::from("  Persist: ./board.json   Esc or ? closes this overlay."),
     ];
     frame.render_widget(
         Paragraph::new(text).block(
@@ -252,6 +261,37 @@ fn draw_inline_title(frame: &mut Frame, area: Rect, state: &InlineTitle) {
     );
 }
 
+fn draw_review_prompt(frame: &mut Frame, area: Rect, app: &App, card_id: &str) {
+    let popup = centered(area, area.width.min(64), 11);
+    frame.render_widget(Clear, popup);
+    let card = app.board.get(card_id);
+    let title = card.map(|c| c.title.as_str()).unwrap_or("(missing)");
+    let rev = card
+        .and_then(|c| c.rev_badge())
+        .unwrap_or_else(|| "rev 0".into());
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                " Review ",
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(format!("  {title}  ({rev})")),
+            Line::from(""),
+            Line::from("  a / Enter    accept → Done"),
+            Line::from("  v            revise body/comments → To Do (rev + 1)"),
+            Line::from("  Esc          cancel"),
+        ])
+        .block(
+            Block::default()
+                .title(" Accept or revise ")
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(Color::Magenta)),
+        ),
+        popup,
+    );
+}
+
 fn draw_fullscreen_editor(frame: &mut Frame, area: Rect, app: &App, state: &EditorState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -264,18 +304,28 @@ fn draw_fullscreen_editor(frame: &mut Frame, area: Rect, app: &App, state: &Edit
         .split(area);
 
     let card = app.board.get(&state.card_id);
+    let (line, col) = match state.field {
+        EditorField::Title => (0, state.cursor),
+        EditorField::Body => line_col(&state.body, state.cursor),
+    };
     let meta = match card {
         Some(c) => format!(
-            " {}  ·  {}  ·  {} ",
+            " {}  ·  {}  ·  Ln {}, Col {}  ·  {} ",
             c.status.title(),
             c.rev_badge().unwrap_or_else(|| "rev 0".into()),
+            line + 1,
+            col + 1,
             c.id
         ),
-        None => String::new(),
+        None => format!(" Ln {}, Col {} ", line + 1, col + 1),
+    };
+    let heading = match state.commit {
+        EditorCommit::Revise => " Revise (save → To Do) ",
+        EditorCommit::Save => " Full-screen editor ",
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" Full-screen editor ", TITLE_STYLE),
+            Span::styled(heading, TITLE_STYLE),
             Span::styled(meta, Style::new().fg(Color::DarkGray)),
         ])),
         chunks[0],
@@ -293,21 +343,33 @@ fn draw_fullscreen_editor(frame: &mut Frame, area: Rect, app: &App, state: &Edit
     );
 
     let body_focused = state.field == EditorField::Body;
+    let body_block = Block::default()
+        .title(" Body / comments / context ")
+        .borders(Borders::ALL)
+        .border_style(field_style(body_focused));
+    let inner_h = body_block.inner(chunks[2]).height;
+    let mut scroll = state.scroll;
+    if body_focused {
+        let line = line as u16;
+        if line < scroll {
+            scroll = line;
+        } else if inner_h > 0 && line >= scroll.saturating_add(inner_h) {
+            scroll = line.saturating_sub(inner_h.saturating_sub(1));
+        }
+    }
     frame.render_widget(
         Paragraph::new(with_cursor(&state.body, state.cursor, body_focused))
             .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Body / context ")
-                    .borders(Borders::ALL)
-                    .border_style(field_style(body_focused)),
-            ),
+            .scroll((scroll, 0))
+            .block(body_block),
         chunks[2],
     );
 
     frame.render_widget(
-        Paragraph::new(" Tab title/body  ·  Enter newline in body  ·  Ctrl+S save  ·  Esc cancel ")
-            .style(Style::new().fg(Color::DarkGray)),
+        Paragraph::new(
+            " Tab fields  ·  ↑↓ lines  ·  Home/End line  ·  Ctrl+S save  ·  Ctrl+T save→To Do  ·  Esc ",
+        )
+        .style(Style::new().fg(Color::DarkGray)),
         chunks[3],
     );
 }
@@ -386,12 +448,12 @@ mod tests {
     }
 
     #[test]
-    fn help_overlay_lists_m1_keymap() {
+    fn help_overlay_lists_m2_keymap() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::load_from(dir.path().join("board.json")).unwrap();
         app.mode = Mode::Help;
 
-        let backend = TestBackend::new(120, 28);
+        let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(&terminal);
@@ -399,9 +461,9 @@ mod tests {
         assert!(text.contains("select card in the focused column"));
         assert!(text.contains("./board.json"));
         assert!(text.contains("quit"));
-        assert!(!text.contains("grok"));
-        assert!(!text.contains("accept"));
-        assert!(!text.contains("revise"));
+        assert!(text.contains("accept"));
+        assert!(text.contains("revise"));
+        assert!(text.contains("To Do"));
     }
 
     #[test]
@@ -416,6 +478,9 @@ mod tests {
             body: "context".into(),
             field: EditorField::Body,
             cursor: 0,
+            preferred_col: 0,
+            scroll: 0,
+            commit: EditorCommit::Save,
         });
 
         let backend = TestBackend::new(80, 20);
@@ -423,7 +488,7 @@ mod tests {
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("Full-screen editor"));
-        assert!(text.contains("Body / context"));
+        assert!(text.contains("Body / comments / context") || text.contains("comments"));
         assert!(text.contains("context"));
     }
 }

@@ -60,11 +60,16 @@ mod tests {
     #[test]
     fn default_path_is_cwd_board_json() {
         let prev = std::env::var("AGENT_KANBAN_BOARD").ok();
-        std::env::remove_var("AGENT_KANBAN_BOARD");
+        // env mutation is unsafe on Rust 1.87+; this test restores the prior value.
+        unsafe {
+            std::env::remove_var("AGENT_KANBAN_BOARD");
+        }
         assert_eq!(default_board_path(), PathBuf::from("board.json"));
-        match prev {
-            Some(v) => std::env::set_var("AGENT_KANBAN_BOARD", v),
-            None => std::env::remove_var("AGENT_KANBAN_BOARD"),
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AGENT_KANBAN_BOARD", v),
+                None => std::env::remove_var("AGENT_KANBAN_BOARD"),
+            }
         }
     }
 
