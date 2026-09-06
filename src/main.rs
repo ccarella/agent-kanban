@@ -25,7 +25,9 @@ fn main() -> Result<()> {
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
-        if event::poll(Duration::from_millis(200))? {
+        // Faster poll while a job is running so the spinner ticks without a keypress.
+        let poll_ms = if app.inflight.is_some() { 80 } else { 200 };
+        if event::poll(Duration::from_millis(poll_ms))? {
             match event::read()? {
                 Event::Key(key) => app.handle_key(key),
                 Event::Resize(_, _) => {}

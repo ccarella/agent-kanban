@@ -13,6 +13,8 @@ pub const STUB_FAIL_MARKER: &str = "[stub:fail]";
 
 pub const DEFAULT_INTERVAL_MS: u64 = 2000;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Default stub pause so In Progress + spinner stay visible in smoke (tests use 0).
+pub const DEFAULT_STUB_DELAY_MS: u64 = 500;
 pub const LOG_MESSAGE_MAX: usize = 4000;
 
 #[derive(Debug, Clone)]
@@ -27,6 +29,8 @@ pub struct DispatchConfig {
     pub cwd: PathBuf,
     pub timeout: Duration,
     pub interval: Duration,
+    /// Stub-only pause so In Progress + spinner are visible during smoke (0 in tests).
+    pub stub_delay: Duration,
 }
 
 impl DispatchConfig {
@@ -59,6 +63,10 @@ impl DispatchConfig {
             cwd,
             timeout: Duration::from_secs(timeout_secs),
             interval: Duration::from_millis(interval_ms),
+            stub_delay: Duration::from_millis(env_u64(
+                "AGENT_KANBAN_STUB_DELAY_MS",
+                DEFAULT_STUB_DELAY_MS,
+            )),
         }
     }
 
@@ -72,6 +80,7 @@ impl DispatchConfig {
             cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             timeout: Duration::from_secs(5),
             interval: Duration::from_millis(0),
+            stub_delay: Duration::ZERO,
         }
     }
 }
@@ -171,7 +180,7 @@ pub fn grok_args(prompt: &str, cwd: &str) -> Vec<String> {
 
 pub fn run_dispatch(config: &DispatchConfig, card: &Card) -> DispatchOutcome {
     if config.stub {
-        run_stub(config, card)
+        run_stub(config, card, None)
     } else {
         run_grok(config, card, None)
     }
@@ -183,12 +192,39 @@ pub fn stub_should_fail(config: &DispatchConfig, card: &Card) -> bool {
         || card.body.contains(STUB_FAIL_MARKER)
 }
 
-fn run_stub(config: &DispatchConfig, card: &Card) -> DispatchOutcome {
+fn run_stub(config: &DispatchConfig, card: &Card, kill: Option<&Receiver<()>>) -> DispatchOutcome {
+    if let Some(cancelled) = wait_stub_delay(config, kill) {
+        return cancelled;
+    }
     if stub_should_fail(config, card) {
         DispatchOutcome::failure("stub dispatch failed")
     } else {
         DispatchOutcome::success(format!("stub dispatch ok: {}", card.title))
     }
+}
+
+/// Sleep in short slices so quit can cancel a delayed stub.
+fn wait_stub_delay(
+    config: &DispatchConfig,
+    kill: Option<&Receiver<()>>,
+) -> Option<DispatchOutcome> {
+    if config.stub_delay.is_zero() {
+        return None;
+    }
+    let start = Instant::now();
+    while start.elapsed() < config.stub_delay {
+        if let Some(kill) = kill {
+            match kill.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => {
+                    return Some(DispatchOutcome::failure("dispatch cancelled"));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        let remaining = config.stub_delay.saturating_sub(start.elapsed());
+        thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+    None
 }
 
 /// Spawn a worker thread. The kill sender interrupts a live grok child.
@@ -200,7 +236,7 @@ pub fn spawn_dispatch(
     let (kill_tx, kill_rx) = mpsc::channel();
     thread::spawn(move || {
         let outcome = if config.stub {
-            run_stub(&config, &card)
+            run_stub(&config, &card, Some(&kill_rx))
         } else {
             run_grok(&config, &card, Some(&kill_rx))
         };

@@ -4,10 +4,35 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
+use std::time::Duration;
+
 use crate::app::{line_col, App, EditorCommit, EditorField, EditorState, InlineTitle, Mode};
-use crate::model::{Card, Status};
+use crate::model::{truncate_chars, Card, Status};
 
 const TITLE_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
+pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+pub fn spinner_glyph(tick: u64) -> char {
+    SPINNER_FRAMES[tick as usize % SPINNER_FRAMES.len()]
+}
+
+/// Status-line text while dispatch is in flight. `tick` must advance from the event loop.
+pub fn format_running_line(kind: &str, title: &str, tick: u64, elapsed: Duration) -> String {
+    format!(
+        "{} Dispatching ({kind}): {} · {:.1}s",
+        spinner_glyph(tick),
+        truncate_chars(title, 40),
+        elapsed.as_secs_f32()
+    )
+}
+
+pub fn format_error_snippet(message: &str, max: usize) -> String {
+    format!(
+        "! {}",
+        truncate_chars(message, max.saturating_sub(2).max(8))
+    )
+}
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -33,7 +58,7 @@ fn draw_board_chrome(frame: &mut Frame, area: Rect, app: &App) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(6),
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Length(1),
         ])
         .split(area);
@@ -50,9 +75,9 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(" Agent Kanban ", TITLE_STYLE),
         Span::styled(
             if app.dispatch_config.stub {
-                "M2 · v0.2 · stub"
+                "M3 · v0.2 · stub"
             } else {
-                "M2 · v0.2"
+                "M3 · v0.2"
             },
             Style::new().fg(Color::DarkGray),
         ),
@@ -101,12 +126,15 @@ fn column_border_style(status: Status, focused: bool) -> Style {
 fn draw_column(frame: &mut Frame, area: Rect, app: &App, status: Status) {
     let focused = app.focused == status;
     let cards = app.board.cards_in(status);
-    let title = format!(
-        " {} {} ({}) ",
-        if focused { "▸" } else { " " },
-        status.title(),
-        cards.len()
-    );
+    let running = status == Status::InProgress && app.inflight.is_some();
+    let mark = if running {
+        spinner_glyph(app.tick).to_string()
+    } else if focused {
+        "▸".to_string()
+    } else {
+        " ".to_string()
+    };
+    let title = format!(" {mark} {} ({}) ", status.title(), cards.len());
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -132,19 +160,28 @@ fn draw_column(frame: &mut Frame, area: Rect, app: &App, status: Status) {
     let mut lines: Vec<Line> = Vec::new();
     for card in cards {
         let selected = app.selected_id.as_deref() == Some(card.id.as_str());
-        lines.extend(card_lines(card, selected, inner.width));
+        lines.extend(card_lines(app, card, selected, inner.width));
         lines.push(Line::from(""));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn card_lines(card: &Card, selected: bool, width: u16) -> Vec<Line<'static>> {
-    let marker = if selected { "▶" } else { " " };
+fn card_lines(app: &App, card: &Card, selected: bool, width: u16) -> Vec<Line<'static>> {
+    let running = app.is_dispatching(&card.id);
+    let marker = if running {
+        spinner_glyph(app.tick).to_string()
+    } else if selected {
+        "▶".to_string()
+    } else {
+        " ".to_string()
+    };
     let badge = card.rev_badge();
     let badge_width = badge.as_ref().map(|b| b.chars().count() + 1).unwrap_or(0);
     let max = (width as usize).saturating_sub(4 + badge_width).max(6);
-    let title = crate::model::truncate_chars(&card.title, max);
-    let title_style = if selected {
+    let title = truncate_chars(&card.title, max);
+    let title_style = if running {
+        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else if selected {
         Style::new()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD | Modifier::REVERSED)
@@ -162,23 +199,57 @@ fn card_lines(card: &Card, selected: bool, width: u16) -> Vec<Line<'static>> {
             Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
         ));
     }
-    vec![Line::from(spans)]
+    let mut lines = vec![Line::from(spans)];
+    if !running {
+        if let Some(err) = card.board_error_snippet() {
+            let snippet = format_error_snippet(&err, (width as usize).saturating_sub(2).max(10));
+            lines.push(Line::from(Span::styled(
+                format!("  {snippet}"),
+                Style::new().fg(Color::Red),
+            )));
+        }
+    }
+    lines
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let col = app.focused.title();
-    let msg = if app.status_message.is_empty() {
+    let running = app.running_status_line();
+    let msg = if let Some(live) = running.clone() {
+        live
+    } else if app.status_message.is_empty() {
         "press ? for keys".to_string()
     } else {
         app.status_message.clone()
     };
-    let line = Line::from(vec![
+    let live_style = if running.is_some() {
+        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else if app.status_message.starts_with("Agent failed") {
+        Style::new().fg(Color::Red)
+    } else {
+        Style::new()
+    };
+    let action = Line::from(vec![
         Span::styled(format!(" {col} "), Style::new().fg(Color::Cyan)),
         Span::styled("│ ", Style::new().fg(Color::DarkGray)),
-        Span::raw(msg),
+        Span::styled(msg, live_style),
     ]);
+    let detail_text = app
+        .selected_outcome_line()
+        .unwrap_or_else(|| "  press ? for keys".to_string());
+    let detail_style = if app
+        .selected_card()
+        .and_then(|c| c.latest_outcome())
+        .is_some_and(|o| o.kind == "error")
+        && app.inflight.is_none()
+    {
+        Style::new().fg(Color::Red)
+    } else {
+        Style::new().fg(Color::DarkGray)
+    };
+    let detail = Line::from(Span::styled(format!(" {detail_text}"), detail_style));
     frame.render_widget(
-        Paragraph::new(line).block(Block::default().borders(Borders::TOP)),
+        Paragraph::new(vec![action, detail]).block(Block::default().borders(Borders::TOP)),
         area,
     );
 }
@@ -204,11 +275,11 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(area, 76, 24);
+    let popup = centered(area, 76, 26);
     frame.render_widget(Clear, popup);
     let text = vec![
         Line::from(Span::styled(
-            "Keyboard (M2 dispatcher + Review)",
+            "Keyboard (M3 live status + Review)",
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -222,6 +293,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  ?                      this help"),
         Line::from(""),
         Line::from("  Dispatcher picks one To Do card (in-process interval; no cron)."),
+        Line::from("  In Progress shows a live spinner (event-loop tick, no relaunch)."),
+        Line::from("  Latest error/summary is on the status line and failed cards."),
         Line::from("  Persist: ./board.json   Esc or ? closes this overlay."),
     ];
     frame.render_widget(
@@ -448,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn help_overlay_lists_m2_keymap() {
+    fn help_overlay_lists_m3_keymap() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::load_from(dir.path().join("board.json")).unwrap();
         app.mode = Mode::Help;
@@ -464,6 +537,75 @@ mod tests {
         assert!(text.contains("accept"));
         assert!(text.contains("revise"));
         assert!(text.contains("To Do"));
+        assert!(text.contains("spinner") || text.contains("live"));
+        assert!(text.contains("error") || text.contains("summary"));
+    }
+
+    fn hung_inflight(card_id: String) -> crate::app::Inflight {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let (kill, _kill_rx) = std::sync::mpsc::channel();
+        crate::app::Inflight {
+            card_id,
+            rx,
+            kill,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn inflight_card_shows_spinner_that_changes_on_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::load_from(dir.path().join("board.json")).unwrap();
+        let mut card = Card::new("Running now");
+        card.status = crate::model::Status::InProgress;
+        app.board.add_card(card);
+        app.selected_id = Some(app.board.cards[0].id.clone());
+        app.focused = crate::model::Status::InProgress;
+        app.inflight = Some(hung_inflight(app.board.cards[0].id.clone()));
+        app.tick = 0;
+
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let first = buffer_text(&terminal);
+        assert!(first.contains("Running now"), "{first}");
+        assert!(first.contains(spinner_glyph(0)), "{first}");
+        assert!(first.contains("Dispatching"), "{first}");
+
+        app.pulse();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let second = buffer_text(&terminal);
+        assert!(second.contains(spinner_glyph(1)), "{second}");
+        assert_ne!(
+            spinner_glyph(0),
+            spinner_glyph(1),
+            "pulse must change the glyph without a keypress"
+        );
+    }
+
+    #[test]
+    fn failed_card_error_is_visible_in_board_ui() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::load_from(dir.path().join("board.json")).unwrap();
+        let mut card = Card::new("Broken card");
+        card.status = crate::model::Status::Todo;
+        card.revision_count = 1;
+        card.log("error", "missing binary: grok");
+        app.board.add_card(card);
+        app.selected_id = Some(app.board.cards[0].id.clone());
+        app.focused = crate::model::Status::Todo;
+        app.status_message = "Agent failed → To Do (rev 1) — missing binary: grok".into();
+
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Broken card"), "{text}");
+        assert!(
+            text.contains("missing binary: grok"),
+            "error must be readable without JSON, got {text}"
+        );
+        assert!(text.contains("error") || text.contains("!"), "{text}");
     }
 
     #[test]

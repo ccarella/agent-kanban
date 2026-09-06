@@ -3,7 +3,7 @@ name = "agent-kanban"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Terminal Kanban board (M2 — grok dispatcher + Review loop)"
+description = "Terminal Kanban board (M3 — live In Progress + readable errors)"
 license = "MIT"
 publish = false
 

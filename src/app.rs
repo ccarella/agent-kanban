@@ -55,6 +55,7 @@ pub struct Inflight {
     pub card_id: String,
     pub rx: Receiver<DispatchOutcome>,
     pub kill: Sender<()>,
+    pub started: Instant,
 }
 
 pub struct App {
@@ -70,6 +71,8 @@ pub struct App {
     pub inflight: Option<Inflight>,
     /// Cards that failed dispatch this session; skipped until a human edit/move/revise.
     pub dispatch_cooldown: HashSet<String>,
+    /// Event-loop pulse; advances the In Progress spinner without a keypress.
+    pub tick: u64,
 }
 
 impl App {
@@ -101,6 +104,7 @@ impl App {
             last_dispatch_wake: Instant::now(),
             inflight: None,
             dispatch_cooldown: HashSet::new(),
+            tick: 0,
         };
         app.ensure_selection();
         app.reclaim_orphaned_in_progress();
@@ -126,6 +130,54 @@ impl App {
     pub fn dispatching_title(&self) -> Option<String> {
         let id = self.inflight.as_ref()?.card_id.as_str();
         self.board.get(id).map(|c| c.title.clone())
+    }
+
+    pub fn is_dispatching(&self, id: &str) -> bool {
+        self.inflight.as_ref().is_some_and(|i| i.card_id == id)
+    }
+
+    /// Advance the UI pulse (spinner). Called from the event loop, not only on keys.
+    pub fn pulse(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+    }
+
+    /// Status-line text while a job is running (spinner + elapsed).
+    pub fn running_status_line(&self) -> Option<String> {
+        let inf = self.inflight.as_ref()?;
+        let title = self
+            .board
+            .get(&inf.card_id)
+            .map(|c| c.title.as_str())
+            .unwrap_or("card");
+        let kind = if self.dispatch_config.stub {
+            "stub"
+        } else {
+            "grok"
+        };
+        Some(crate::ui::format_running_line(
+            kind,
+            title,
+            self.tick,
+            inf.started.elapsed(),
+        ))
+    }
+
+    /// Selected card's latest error or summary — readable without opening JSON.
+    pub fn selected_outcome_line(&self) -> Option<String> {
+        let card = self.selected_card()?;
+        if self.is_dispatching(&card.id) {
+            return Some("live · agent running (updates without quit)".into());
+        }
+        let outcome = card.latest_outcome()?;
+        let label = if outcome.kind == "error" {
+            "error"
+        } else {
+            "last"
+        };
+        Some(format!(
+            "{label} · {}",
+            crate::model::truncate_chars(&outcome.message, 160)
+        ))
     }
 
     fn ensure_selection(&mut self) {
@@ -511,6 +563,7 @@ impl App {
 
     /// Interval wake: finish a running job, then maybe pick one To Do card.
     pub fn on_tick(&mut self) {
+        self.pulse();
         self.poll_dispatch();
         self.maybe_start_dispatch();
     }
@@ -568,6 +621,7 @@ impl App {
             card_id: id,
             rx,
             kill,
+            started: Instant::now(),
         });
         let kind = if self.dispatch_config.stub {
             "stub"
@@ -592,17 +646,23 @@ impl App {
         match outcome.kind {
             OutcomeKind::Success => {
                 card.status = Status::Review;
-                card.log("success", outcome.message);
-                self.status_message = format!("Agent finished → Review ({})", card.title);
+                let msg = outcome.message.clone();
+                card.log("success", msg.clone());
+                self.status_message = format!(
+                    "Agent finished → Review — {}",
+                    crate::model::truncate_chars(&msg, 140)
+                );
             }
             OutcomeKind::Failure => {
                 card.status = Status::Todo;
                 card.revision_count = card.revision_count.saturating_add(1);
-                card.log("error", outcome.message);
+                let msg = outcome.message.clone();
+                card.log("error", msg.clone());
                 self.dispatch_cooldown.insert(id.to_string());
                 self.status_message = format!(
                     "Agent failed → To Do (rev {}) — {}",
-                    card.revision_count, card.title
+                    card.revision_count,
+                    crate::model::truncate_chars(&msg, 140)
                 );
             }
         }
@@ -1125,6 +1185,17 @@ mod tests {
 
         let loaded = persist::load_board(&dir.path().join("board.json")).unwrap();
         assert_eq!(loaded.cards[0].status, Status::Review);
+        assert!(
+            app.status_message.contains("stub dispatch ok"),
+            "success status line must include the summary, got {}",
+            app.status_message
+        );
+        app.selected_id = Some(app.board.cards[0].id.clone());
+        let detail = app.selected_outcome_line().expect("detail");
+        assert!(
+            detail.contains("stub dispatch ok"),
+            "selected detail must show the summary, got {detail}"
+        );
     }
 
     #[test]
@@ -1142,6 +1213,21 @@ mod tests {
             .iter()
             .any(|e| e.kind == "error"));
         assert!(app.inflight.is_none());
+        assert!(
+            app.status_message.contains("stub dispatch failed"),
+            "failed status line must include the error, got {}",
+            app.status_message
+        );
+        app.selected_id = Some(app.board.cards[0].id.clone());
+        let detail = app.selected_outcome_line().expect("detail");
+        assert!(
+            detail.contains("stub dispatch failed"),
+            "selected detail must show the error, got {detail}"
+        );
+        assert_eq!(
+            app.board.cards[0].board_error_snippet().as_deref(),
+            Some("stub dispatch failed")
+        );
     }
 
     #[test]
@@ -1258,5 +1344,40 @@ mod tests {
         assert_eq!(line_col("ab\ncd", 3), (1, 0));
         assert_eq!(cursor_at_line_col("ab\ncd", 1, 1), 4);
         assert_eq!(cursor_at_line_col("ab\ncd", 0, 99), 2);
+    }
+
+    #[test]
+    fn on_tick_advances_spinner_without_a_keypress() {
+        let (mut app, _dir) = app_in_tmp();
+        app.dispatch_config.enabled = false;
+        let start = app.tick;
+        app.on_tick();
+        app.on_tick();
+        assert!(
+            app.tick > start,
+            "event-loop tick must pulse without handle_key"
+        );
+        assert_ne!(
+            crate::ui::spinner_glyph(0),
+            crate::ui::spinner_glyph(1),
+            "spinner frames must change as tick advances"
+        );
+    }
+
+    #[test]
+    fn running_status_line_includes_spinner_and_kind() {
+        let (mut app, _dir) = app_in_tmp();
+        app.board.add_card(todo_card("Live card"));
+        app.on_tick();
+        assert!(app.inflight.is_some());
+        let line = app.running_status_line().expect("running line");
+        assert!(line.contains("Dispatching (stub)"), "{line}");
+        assert!(
+            crate::ui::SPINNER_FRAMES
+                .iter()
+                .any(|ch| line.contains(*ch)),
+            "expected spinner glyph in {line}"
+        );
+        assert!(line.contains("Live card"), "{line}");
     }
 }

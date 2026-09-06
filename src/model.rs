@@ -106,6 +106,31 @@ impl Card {
         self.agent_log.last()
     }
 
+    pub fn latest_error(&self) -> Option<&AgentLogEntry> {
+        self.agent_log.iter().rev().find(|e| e.kind == "error")
+    }
+
+    pub fn latest_success(&self) -> Option<&AgentLogEntry> {
+        self.agent_log.iter().rev().find(|e| e.kind == "success")
+    }
+
+    /// Most recent dispatch outcome the TUI should surface (error or success).
+    pub fn latest_outcome(&self) -> Option<&AgentLogEntry> {
+        self.agent_log
+            .iter()
+            .rev()
+            .find(|e| e.kind == "error" || e.kind == "success")
+    }
+
+    /// Compact `! …` line when the latest outcome is still a failure.
+    pub fn board_error_snippet(&self) -> Option<String> {
+        let outcome = self.latest_outcome()?;
+        if outcome.kind != "error" {
+            return None;
+        }
+        Some(outcome.message.clone())
+    }
+
     pub fn rev_badge(&self) -> Option<String> {
         if self.revision_count > 0 {
             Some(format!("rev {}", self.revision_count))
@@ -202,6 +227,23 @@ mod tests {
         assert_eq!(card.agent_log.len(), 1);
         assert_eq!(card.last_log().unwrap().kind, "success");
         assert!(card.updated_at >= before);
+    }
+
+    #[test]
+    fn latest_outcome_prefers_error_until_a_later_success() {
+        let mut card = Card::new("Work");
+        card.log("dispatch", "picked");
+        card.log("error", "missing binary: grok");
+        assert_eq!(card.latest_error().unwrap().message, "missing binary: grok");
+        assert_eq!(
+            card.board_error_snippet().as_deref(),
+            Some("missing binary: grok")
+        );
+        assert_eq!(card.latest_outcome().unwrap().kind, "error");
+        card.log("success", "patched login");
+        assert!(card.board_error_snippet().is_none());
+        assert_eq!(card.latest_success().unwrap().message, "patched login");
+        assert_eq!(card.latest_outcome().unwrap().kind, "success");
     }
 
     #[test]
