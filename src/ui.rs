@@ -28,10 +28,20 @@ pub fn format_running_line(kind: &str, title: &str, tick: u64, elapsed: Duration
 }
 
 pub fn format_error_snippet(message: &str, max: usize) -> String {
-    format!(
-        "! {}",
-        truncate_chars(message, max.saturating_sub(2).max(8))
-    )
+    clamp_chars(&format!("! {message}"), max.max(3))
+}
+
+/// Truncate to at most `max` chars (ellipsis included). Unlike `truncate_chars`,
+/// this never exceeds `max` — needed so card error lines do not wrap.
+fn clamp_chars(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        truncate_chars(s, max.saturating_sub(1))
+    }
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -202,9 +212,9 @@ fn card_lines(app: &App, card: &Card, selected: bool, width: u16) -> Vec<Line<'s
     let mut lines = vec![Line::from(spans)];
     if !running {
         if let Some(err) = card.board_error_snippet() {
-            let snippet = format_error_snippet(&err, (width as usize).saturating_sub(2).max(10));
+            let snippet = format_error_snippet(&err, (width as usize).max(8));
             lines.push(Line::from(Span::styled(
-                format!("  {snippet}"),
+                snippet,
                 Style::new().fg(Color::Red),
             )));
         }
@@ -492,6 +502,14 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn error_snippet_fits_narrow_column() {
+        let snippet = format_error_snippet("missing binary: grok", 22);
+        assert!(snippet.chars().count() <= 22, "{snippet}");
+        assert!(snippet.starts_with('!'), "{snippet}");
+        assert!(snippet.contains("missing"), "{snippet}");
     }
 
     #[test]
