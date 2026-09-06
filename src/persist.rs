@@ -24,9 +24,8 @@ pub fn load_board(path: &Path) -> Result<Board> {
     }
     let data = fs::read_to_string(path)
         .with_context(|| format!("failed to read board file {}", path.display()))?;
-    let mut board: Board = serde_json::from_str(&data)
+    let board: Board = serde_json::from_str(&data)
         .with_context(|| format!("failed to parse board file {}", path.display()))?;
-    board.recover_interrupted_runs();
     Ok(board)
 }
 
@@ -46,41 +45,42 @@ pub fn save_board(path: &Path, board: &Board) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Card, CardStatus, Column};
+    use crate::model::{AgentLogEntry, Card, Status};
 
     #[test]
-    fn roundtrip_preserves_cards() {
+    fn roundtrip_preserves_v1_fields() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("board.json");
         let mut board = Board::default();
-        board.add_card(Card::new("Hello", "World"));
+        let mut card = Card::new("Hello");
+        card.body = "context goes here".into();
+        card.status = Status::Review;
+        card.revision_count = 1;
+        card.agent_log.push(AgentLogEntry {
+            at: card.created_at.clone(),
+            kind: "revision".into(),
+            message: "add tests".into(),
+        });
+        board.add_card(card);
         save_board(&path, &board).unwrap();
+
         let loaded = load_board(&path).unwrap();
+        assert_eq!(loaded.version, 1);
         assert_eq!(loaded.cards.len(), 1);
-        assert_eq!(loaded.cards[0].title, "Hello");
-        assert_eq!(loaded.cards[0].body, "World");
+        let c = &loaded.cards[0];
+        assert_eq!(c.title, "Hello");
+        assert_eq!(c.body, "context goes here");
+        assert_eq!(c.status, Status::Review);
+        assert_eq!(c.revision_count, 1);
+        assert_eq!(c.agent_log[0].message, "add tests");
+        assert!(!c.created_at.is_empty());
+        assert!(!c.updated_at.is_empty());
     }
 
     #[test]
     fn missing_file_is_empty_board() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing.json");
-        let board = load_board(&path).unwrap();
+        let board = load_board(&dir.path().join("missing.json")).unwrap();
         assert!(board.cards.is_empty());
-    }
-
-    #[test]
-    fn load_recovers_running_status() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("board.json");
-        let mut board = Board::default();
-        let mut card = Card::new("Live", "prompt");
-        card.column = Column::Running;
-        card.status = CardStatus::Running;
-        board.add_card(card);
-        save_board(&path, &board).unwrap();
-        let loaded = load_board(&path).unwrap();
-        assert_eq!(loaded.cards[0].column, Column::Done);
-        assert_eq!(loaded.cards[0].status, CardStatus::Failed);
     }
 }

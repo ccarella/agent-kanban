@@ -1,14 +1,15 @@
 [package]
 name = "agent-kanban"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Terminal Kanban board that dispatches cards via grok -p"
+description = "Terminal Kanban board (M1 board shell — no agent dispatch)"
 license = "MIT"
 publish = false
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 crossterm = "0.28"
 dirs = "6"
 ratatui = "0.29"

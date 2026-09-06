@@ -4,13 +4,35 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, EditorField, EditorState, Mode};
-use crate::model::{Card, CardStatus, Column};
+use crate::app::{App, EditorField, EditorState, InlineTitle, Mode, ReviseState};
+use crate::model::{Card, Status};
 
 const TITLE_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    match &app.mode {
+        Mode::Editor(state) => {
+            draw_fullscreen_editor(frame, area, app, state);
+            return;
+        }
+        Mode::Revise(state) => {
+            draw_board_chrome(frame, area, app);
+            draw_revise(frame, area, state);
+            return;
+        }
+        _ => draw_board_chrome(frame, area, app),
+    }
+
+    match &app.mode {
+        Mode::Help => draw_help(frame, area),
+        Mode::InlineTitle(state) => draw_inline_title(frame, area, state),
+        Mode::ReviewPick { title, .. } => draw_review_pick(frame, area, title),
+        Mode::Board | Mode::Editor(_) | Mode::Revise(_) => {}
+    }
+}
+
+fn draw_board_chrome(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -25,20 +47,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_columns(frame, chunks[1], app);
     draw_status(frame, chunks[2], app);
     draw_footer(frame, chunks[3]);
-
-    match &app.mode {
-        Mode::Help => draw_help(frame, area),
-        Mode::Editor(state) => draw_editor(frame, area, app, state),
-        Mode::ConfirmDelete { title, .. } => draw_confirm_delete(frame, area, title),
-        Mode::Board => {}
-    }
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let path = app.board_path.display().to_string();
     let header = Line::from(vec![
         Span::styled(" Agent Kanban ", TITLE_STYLE),
-        Span::styled("v0.1", Style::new().fg(Color::DarkGray)),
+        Span::styled("M1 · v0.2", Style::new().fg(Color::DarkGray)),
         Span::raw("  "),
         Span::styled(path, Style::new().fg(Color::DarkGray)),
     ]);
@@ -49,23 +64,31 @@ fn draw_columns(frame: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
         ])
         .split(area);
 
-    for (i, column) in Column::ALL.iter().enumerate() {
-        draw_column(frame, cols[i], app, *column);
+    for (i, status) in Status::ALL.iter().enumerate() {
+        draw_column(frame, cols[i], app, *status);
     }
 }
 
-fn column_border_style(column: Column, focused: bool) -> Style {
-    let color = match column {
-        Column::Backlog => Color::Blue,
-        Column::Running => Color::Yellow,
-        Column::Done => Color::Green,
-    };
+fn column_color(status: Status) -> Color {
+    match status {
+        Status::Capture => Color::Cyan,
+        Status::ToDo => Color::Blue,
+        Status::InProgress => Color::Yellow,
+        Status::Review => Color::Magenta,
+        Status::Done => Color::Green,
+    }
+}
+
+fn column_border_style(status: Status, focused: bool) -> Style {
+    let color = column_color(status);
     if focused {
         Style::new().fg(color).add_modifier(Modifier::BOLD)
     } else {
@@ -73,35 +96,25 @@ fn column_border_style(column: Column, focused: bool) -> Style {
     }
 }
 
-fn status_style(status: CardStatus) -> Style {
-    match status {
-        CardStatus::Idle => Style::new().fg(Color::DarkGray),
-        CardStatus::Running => Style::new().fg(Color::Yellow),
-        CardStatus::Success => Style::new().fg(Color::Green),
-        CardStatus::Failed => Style::new().fg(Color::Red),
-    }
-}
-
-fn draw_column(frame: &mut Frame, area: Rect, app: &App, column: Column) {
-    let focused = app.focused == column;
-    let cards = app.board.cards_in(column);
+fn draw_column(frame: &mut Frame, area: Rect, app: &App, status: Status) {
+    let focused = app.focused_status() == Some(status);
+    let cards = app.board.cards_in(status);
     let title = format!(
         " {} {} ({}) ",
         if focused { "▸" } else { " " },
-        column.title(),
+        status.title(),
         cards.len()
     );
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(column_border_style(column, focused));
-
+        .border_style(column_border_style(status, focused));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     if cards.is_empty() {
-        let hint = if column == Column::Backlog {
-            "empty — press n to create a card"
+        let hint = if status == Status::Capture {
+            "n to capture"
         } else {
             "empty"
         };
@@ -125,8 +138,10 @@ fn draw_column(frame: &mut Frame, area: Rect, app: &App, column: Column) {
 
 fn card_lines(card: &Card, selected: bool, width: u16) -> Vec<Line<'static>> {
     let marker = if selected { "▶" } else { " " };
-    let max = width.saturating_sub(4) as usize;
-    let title = crate::model::truncate_chars(&card.title, max.max(8));
+    let badge = card.rev_badge();
+    let badge_width = badge.as_ref().map(|b| b.chars().count() + 1).unwrap_or(0);
+    let max = (width as usize).saturating_sub(4 + badge_width).max(6);
+    let title = crate::model::truncate_chars(&card.title, max);
     let title_style = if selected {
         Style::new()
             .fg(Color::White)
@@ -134,40 +149,29 @@ fn card_lines(card: &Card, selected: bool, width: u16) -> Vec<Line<'static>> {
     } else {
         Style::new().fg(Color::White)
     };
-    let status = format!("{} {}", card.status.glyph(), card.status.label());
-    let preview = card.summary_preview(max.max(8));
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(format!("{marker} "), title_style),
-            Span::styled(title, title_style),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(status, status_style(card.status)),
-        ]),
+    let mut spans = vec![
+        Span::styled(format!("{marker} "), title_style),
+        Span::styled(title, title_style),
     ];
-    if !preview.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(preview, status_style(card.status)),
-        ]));
+    if let Some(badge) = badge {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            badge,
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ));
     }
-    lines
+    vec![Line::from(spans)]
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    let run = if let Some(secs) = app.run_elapsed_secs() {
-        format!("run: active ({secs}s)")
-    } else {
-        "run: idle".to_string()
-    };
+    let col = app.focused_status().map(Status::title).unwrap_or("—");
     let msg = if app.status_message.is_empty() {
         "press ? for keys".to_string()
     } else {
         app.status_message.clone()
     };
     let line = Line::from(vec![
-        Span::styled(format!(" {run} "), Style::new().fg(Color::Yellow)),
+        Span::styled(format!(" {col} "), Style::new().fg(Color::Cyan)),
         Span::styled("│ ", Style::new().fg(Color::DarkGray)),
         Span::raw(msg),
     ]);
@@ -178,8 +182,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect) {
-    let hints =
-        " h/l cols  j/k cards  n new  Enter edit  r run  1/2/3 move  d del  ? help  q quit ";
+    let hints = " j/k focus  h/l move  n capture  Enter edit  r review  ? help  q quit ";
     frame.render_widget(
         Paragraph::new(hints)
             .style(Style::new().fg(Color::DarkGray))
@@ -199,25 +202,24 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(area, 72, 20);
+    let popup = centered(area, 74, 20);
     frame.render_widget(Clear, popup);
     let text = vec![
         Line::from(Span::styled(
-            "Keyboard",
+            "Keyboard (M1 board shell)",
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  h / ← , l / →          focus column"),
-        Line::from("  j / ↓ , k / ↑          select card in column"),
-        Line::from("  Enter                  edit / view card detail"),
-        Line::from("  n                      new card (Backlog)"),
-        Line::from("  d                      delete selected (confirm y/n)"),
-        Line::from("  1 / 2 / 3              move to Backlog / Running / Done"),
-        Line::from("  r                      dispatch selected via grok -p"),
-        Line::from("  q                      quit (saves the board)"),
+        Line::from("  j / ↓ , k / ↑          move focus among cards"),
+        Line::from("  h / ←                  move focused card one column left"),
+        Line::from("  l / →                  move focused card one column right"),
+        Line::from("  n                      inline title → new card in Capture"),
+        Line::from("  Enter                  full-screen editor (body / context)"),
+        Line::from("  r                      Review only: accept → Done, or revise"),
+        Line::from("  q                      quit (auto-save)"),
         Line::from("  ?                      this help"),
         Line::from(""),
-        Line::from("  One grok -p run at a time. Failed runs go to Done (fail)."),
+        Line::from("  No agent runner in M1. Cards persist to one JSON file."),
         Line::from("  Esc or ? closes this overlay."),
     ];
     frame.render_widget(
@@ -231,33 +233,111 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     );
 }
 
-fn draw_editor(frame: &mut Frame, area: Rect, app: &App, state: &EditorState) {
-    let popup = centered(area, area.width.min(78), area.height.min(22));
+fn draw_inline_title(frame: &mut Frame, area: Rect, state: &InlineTitle) {
+    let popup = centered(area, area.width.min(64), 5);
     frame.render_widget(Clear, popup);
-    let title = if state.card_id.is_some() {
-        " Edit card "
-    } else {
-        " New card "
-    };
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(Color::Cyan));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    let line = with_cursor(&state.buffer, state.cursor, true);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                " New card → Capture ",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(line),
+            Line::from(Span::styled(
+                "Enter create  ·  Esc cancel",
+                Style::new().fg(Color::DarkGray),
+            )),
+        ])
+        .block(
+            Block::default()
+                .title(" Title ")
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(Color::Cyan)),
+        ),
+        popup,
+    );
+}
 
+fn draw_review_pick(frame: &mut Frame, area: Rect, title: &str) {
+    let popup = centered(area, 58, 9);
+    frame.render_widget(Clear, popup);
+    let text = vec![
+        Line::from(""),
+        Line::from(format!("  Review “{}”", title)),
+        Line::from(""),
+        Line::from("  a  accept  →  Done"),
+        Line::from("  v  revise  →  edit comments, then To Do + rev++"),
+        Line::from("  Esc cancel"),
+    ];
+    frame.render_widget(
+        Paragraph::new(text).block(
+            Block::default()
+                .title(" Review ")
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(Color::Magenta)),
+        ),
+        popup,
+    );
+}
+
+fn draw_revise(frame: &mut Frame, area: Rect, state: &ReviseState) {
+    let popup = centered(area, area.width.min(72), 12);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(with_cursor(&state.comments, state.cursor, true))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Revision comments ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().fg(Color::Magenta)),
+            ),
+        popup,
+    );
+    let hint = Rect {
+        x: popup.x,
+        y: popup.y.saturating_add(popup.height.saturating_sub(1)),
+        width: popup.width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(" Ctrl+S → To Do + bump rev   Esc cancel ")
+            .style(Style::new().fg(Color::DarkGray)),
+        hint,
+    );
+}
+
+fn draw_fullscreen_editor(frame: &mut Frame, area: Rect, app: &App, state: &EditorState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Min(6),
-            Constraint::Length(4),
             Constraint::Length(2),
         ])
-        .split(inner);
+        .split(area);
+
+    let card = app.board.get(&state.card_id);
+    let meta = match card {
+        Some(c) => format!(
+            " {}  ·  {}  ·  {} ",
+            c.status.title(),
+            c.rev_badge().unwrap_or_else(|| "rev 0".into()),
+            c.id
+        ),
+        None => String::new(),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Full-screen editor ", TITLE_STYLE),
+            Span::styled(meta, Style::new().fg(Color::DarkGray)),
+        ])),
+        chunks[0],
+    );
 
     let title_focused = state.field == EditorField::Title;
-    let body_focused = state.field == EditorField::Body;
     frame.render_widget(
         Paragraph::new(with_cursor(&state.title, state.cursor, title_focused)).block(
             Block::default()
@@ -265,48 +345,24 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &App, state: &EditorState) {
                 .borders(Borders::ALL)
                 .border_style(field_style(title_focused)),
         ),
-        chunks[0],
+        chunks[1],
     );
+
+    let body_focused = state.field == EditorField::Body;
     frame.render_widget(
         Paragraph::new(with_cursor(&state.body, state.cursor, body_focused))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
-                    .title(" Body / prompt ")
+                    .title(" Body / context ")
                     .borders(Borders::ALL)
                     .border_style(field_style(body_focused)),
             ),
-        chunks[1],
-    );
-
-    let detail = match state.card_id.as_deref().and_then(|id| app.board.get(id)) {
-        Some(card) => format!(
-            "status: {} {}  ·  column: {}  ·  run: {}",
-            card.status.glyph(),
-            card.status.label(),
-            card.column.title(),
-            card.run_id.as_deref().unwrap_or("—")
-        ),
-        None => "new card → Backlog".to_string(),
-    };
-    let summary = state
-        .card_id
-        .as_deref()
-        .and_then(|id| app.board.get(id))
-        .and_then(|c| c.last_summary.clone())
-        .unwrap_or_default();
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(detail, Style::new().fg(Color::DarkGray))),
-            Line::from(Span::styled(
-                crate::model::truncate_chars(&summary, 120),
-                Style::new().fg(Color::Gray),
-            )),
-        ]),
         chunks[2],
     );
+
     frame.render_widget(
-        Paragraph::new("Tab field  ·  Enter title→body / newline  ·  Ctrl+S save  ·  Esc cancel")
+        Paragraph::new(" Tab title/body  ·  Enter newline in body  ·  Ctrl+S save  ·  Esc cancel ")
             .style(Style::new().fg(Color::DarkGray)),
         chunks[3],
     );
@@ -339,26 +395,6 @@ fn with_cursor(text: &str, cursor: usize, show: bool) -> String {
     out
 }
 
-fn draw_confirm_delete(frame: &mut Frame, area: Rect, title: &str) {
-    let popup = centered(area, 56, 7);
-    frame.render_widget(Clear, popup);
-    let text = vec![
-        Line::from(""),
-        Line::from(format!("  Delete card “{}”?", title)),
-        Line::from(""),
-        Line::from("  y confirm   n / Esc cancel"),
-    ];
-    frame.render_widget(
-        Paragraph::new(text).block(
-            Block::default()
-                .title(" Confirm delete ")
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(Color::Red)),
-        ),
-        popup,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,35 +416,68 @@ mod tests {
     }
 
     #[test]
-    fn renders_three_fixed_columns() {
+    fn renders_five_columns_on_one_screen() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::load_from(dir.path().join("board.json")).unwrap();
-        app.board.add_card(Card::new("First card", "do the thing"));
+        let mut card = Card::new("First card");
+        card.revision_count = 2;
+        app.board.add_card(card);
         app.selected_id = Some(app.board.cards[0].id.clone());
 
-        let backend = TestBackend::new(100, 24);
+        let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("Backlog"));
-        assert!(text.contains("Running"));
-        assert!(text.contains("Done"));
-        assert!(text.contains("First card"));
+        assert!(text.contains("Capture"), "{text}");
+        assert!(text.contains("To Do"), "{text}");
+        assert!(text.contains("In Progress"), "{text}");
+        assert!(text.contains("Review"), "{text}");
+        assert!(text.contains("Done"), "{text}");
+        assert!(text.contains("First card"), "{text}");
+        assert!(text.contains("rev 2"), "{text}");
         assert!(text.contains("Agent Kanban"));
+        assert!(!text.contains("Backlog"));
+        assert!(!text.contains("Running"));
+        assert!(!text.contains("grok"));
     }
 
     #[test]
-    fn help_overlay_lists_keymap() {
+    fn help_overlay_lists_m1_keymap() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::load_from(dir.path().join("board.json")).unwrap();
         app.mode = Mode::Help;
 
-        let backend = TestBackend::new(100, 28);
+        let backend = TestBackend::new(120, 28);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("dispatch selected via grok -p"));
-        assert!(text.contains("new card"));
+        assert!(text.contains("new card in Capture"));
+        assert!(text.contains("one column"));
         assert!(text.contains("quit"));
+        assert!(!text.contains("grok"));
+        assert!(!text.contains("dispatch"));
+    }
+
+    #[test]
+    fn editor_is_fullscreen_not_a_small_popup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::load_from(dir.path().join("board.json")).unwrap();
+        app.board.add_card(Card::new("Edit me"));
+        app.selected_id = Some(app.board.cards[0].id.clone());
+        app.mode = Mode::Editor(EditorState {
+            card_id: app.board.cards[0].id.clone(),
+            title: "Edit me".into(),
+            body: "context".into(),
+            field: EditorField::Body,
+            cursor: 0,
+        });
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Full-screen editor"));
+        assert!(text.contains("Body / context"));
+        assert!(text.contains("context"));
     }
 }

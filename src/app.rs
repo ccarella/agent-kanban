@@ -1,13 +1,9 @@
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
-use std::time::Instant;
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::dispatch::{self, DispatchOutcome};
-use crate::model::{Board, Card, CardStatus, Column};
+use crate::model::{now_iso8601, AgentLogEntry, Board, Card, Status};
 use crate::persist;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +14,7 @@ pub enum EditorField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorState {
-    pub card_id: Option<String>,
+    pub card_id: String,
     pub title: String,
     pub body: String,
     pub field: EditorField,
@@ -26,30 +22,35 @@ pub struct EditorState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineTitle {
+    pub buffer: String,
+    pub cursor: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviseState {
+    pub card_id: String,
+    pub comments: String,
+    pub cursor: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Board,
     Help,
+    InlineTitle(InlineTitle),
     Editor(EditorState),
-    ConfirmDelete { id: String, title: String },
-}
-
-pub struct ActiveRun {
-    pub card_id: String,
-    pub run_id: String,
-    pub started: Instant,
-    rx: Receiver<DispatchOutcome>,
+    ReviewPick { id: String, title: String },
+    Revise(ReviseState),
 }
 
 pub struct App {
     pub board: Board,
     pub board_path: PathBuf,
-    pub focused: Column,
     pub selected_id: Option<String>,
     pub mode: Mode,
     pub status_message: String,
     pub should_quit: bool,
-    pub dirty: bool,
-    active_run: Option<ActiveRun>,
 }
 
 impl App {
@@ -64,30 +65,16 @@ impl App {
             selected_id: board.cards.first().map(|c| c.id.clone()),
             board,
             board_path: path,
-            focused: Column::Backlog,
             mode: Mode::Board,
             status_message: String::new(),
             should_quit: false,
-            dirty: false,
-            active_run: None,
         };
-        // Recovery already applied in load_board; surface it once.
-        if app.board.cards.iter().any(|c| {
-            c.status == CardStatus::Failed
-                && c.last_summary
-                    .as_deref()
-                    .is_some_and(|s| s.contains("interrupted"))
-        }) {
-            app.status_message = "Recovered interrupted run(s) → Done (fail).".to_string();
-        }
         app.ensure_selection();
         Ok(app)
     }
 
     pub fn save(&mut self) -> Result<()> {
-        persist::save_board(&self.board_path, &self.board)?;
-        self.dirty = false;
-        Ok(())
+        persist::save_board(&self.board_path, &self.board)
     }
 
     pub fn persist(&mut self) {
@@ -96,28 +83,14 @@ impl App {
         }
     }
 
-    pub fn is_running(&self) -> bool {
-        self.active_run.is_some()
-    }
-
-    pub fn running_card_id(&self) -> Option<&str> {
-        self.active_run.as_ref().map(|r| r.card_id.as_str())
-    }
-
-    pub fn run_elapsed_secs(&self) -> Option<u64> {
-        self.active_run
-            .as_ref()
-            .map(|r| r.started.elapsed().as_secs())
-    }
-
     pub fn selected_card(&self) -> Option<&Card> {
         self.selected_id
             .as_deref()
             .and_then(|id| self.board.get(id))
     }
 
-    fn cards_in(&self, column: Column) -> Vec<&Card> {
-        self.board.cards_in(column)
+    pub fn focused_status(&self) -> Option<Status> {
+        self.selected_card().map(|c| c.status)
     }
 
     fn ensure_selection(&mut self) {
@@ -126,16 +99,17 @@ impl App {
                 return;
             }
         }
-        let focused_cards = self.cards_in(self.focused);
-        self.selected_id = focused_cards
+        self.selected_id = self
+            .board
+            .cards_in_board_order()
             .first()
-            .map(|c| c.id.clone())
-            .or_else(|| self.board.cards.first().map(|c| c.id.clone()));
+            .map(|c| c.id.clone());
     }
 
-    fn select_in_focused(&mut self, delta: isize) {
+    fn select_delta(&mut self, delta: isize) {
         let ids: Vec<String> = self
-            .cards_in(self.focused)
+            .board
+            .cards_in_board_order()
             .into_iter()
             .map(|c| c.id.clone())
             .collect();
@@ -156,21 +130,6 @@ impl App {
         self.selected_id = Some(ids[next].clone());
     }
 
-    fn focus_column(&mut self, column: Column) {
-        self.focused = column;
-        let ids: Vec<String> = self
-            .cards_in(column)
-            .into_iter()
-            .map(|c| c.id.clone())
-            .collect();
-        if let Some(id) = &self.selected_id {
-            if ids.iter().any(|x| x == id) {
-                return;
-            }
-        }
-        self.selected_id = ids.first().cloned();
-    }
-
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -182,40 +141,119 @@ impl App {
 
         match &self.mode {
             Mode::Help => self.handle_help_key(key),
-            Mode::ConfirmDelete { .. } => self.handle_delete_key(key),
+            Mode::InlineTitle(_) => self.handle_inline_title_key(key),
             Mode::Editor(_) => self.handle_editor_key(key),
+            Mode::ReviewPick { .. } => self.handle_review_pick_key(key),
+            Mode::Revise(_) => self.handle_revise_key(key),
             Mode::Board => self.handle_board_key(key),
         }
     }
 
     fn handle_help_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
-                if key.code == KeyCode::Char('q') {
-                    self.quit();
-                } else {
-                    self.mode = Mode::Board;
-                }
-            }
+            KeyCode::Char('q') => self.quit(),
+            KeyCode::Esc | KeyCode::Char('?') => self.mode = Mode::Board,
             _ => self.mode = Mode::Board,
         }
     }
 
-    fn handle_delete_key(&mut self, key: KeyEvent) {
+    fn handle_board_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Mode::ConfirmDelete { id, .. } = &self.mode {
-                    let id = id.clone();
-                    self.delete_card(&id);
-                }
+            KeyCode::Char('q') => self.quit(),
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('j') | KeyCode::Down => self.select_delta(1),
+            KeyCode::Char('k') | KeyCode::Up => self.select_delta(-1),
+            KeyCode::Char('h') | KeyCode::Left => self.shift_selected(-1),
+            KeyCode::Char('l') | KeyCode::Right => self.shift_selected(1),
+            KeyCode::Char('n') => self.start_inline_title(),
+            KeyCode::Enter => self.open_editor(),
+            KeyCode::Char('r') => self.open_review(),
+            _ => {}
+        }
+    }
+
+    fn start_inline_title(&mut self) {
+        self.mode = Mode::InlineTitle(InlineTitle {
+            buffer: String::new(),
+            cursor: 0,
+        });
+        self.status_message = "New card title — Enter creates in Capture, Esc cancels.".to_string();
+    }
+
+    fn handle_inline_title_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
                 self.mode = Mode::Board;
+                self.status_message = "New card cancelled.".to_string();
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.mode = Mode::Board;
-                self.status_message = "Delete cancelled.".to_string();
+            KeyCode::Enter => self.commit_inline_title(),
+            KeyCode::Backspace => {
+                if let Mode::InlineTitle(state) = &mut self.mode {
+                    if state.cursor > 0 {
+                        remove_char(&mut state.buffer, state.cursor - 1);
+                        state.cursor -= 1;
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if let Mode::InlineTitle(state) = &mut self.mode {
+                    remove_char(&mut state.buffer, state.cursor);
+                }
+            }
+            KeyCode::Left => {
+                if let Mode::InlineTitle(state) = &mut self.mode {
+                    state.cursor = state.cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Mode::InlineTitle(state) = &mut self.mode {
+                    state.cursor = (state.cursor + 1).min(state.buffer.chars().count());
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) && ch != '\n' => {
+                if let Mode::InlineTitle(state) = &mut self.mode {
+                    insert_char(&mut state.buffer, state.cursor, ch);
+                    state.cursor += 1;
+                }
             }
             _ => {}
         }
+    }
+
+    fn commit_inline_title(&mut self) {
+        let Mode::InlineTitle(state) = &self.mode else {
+            return;
+        };
+        let title = state.buffer.trim().to_string();
+        if title.is_empty() {
+            self.status_message = "Title is required.".to_string();
+            return;
+        }
+        let card = Card::new(title);
+        self.selected_id = Some(card.id.clone());
+        self.board.add_card(card);
+        self.mode = Mode::Board;
+        self.status_message = "Card created in Capture.".to_string();
+        self.persist();
+    }
+
+    fn open_editor(&mut self) {
+        let Some(card) = self.selected_card().cloned() else {
+            self.status_message = "No card selected. Press n to create one.".to_string();
+            return;
+        };
+        self.mode = Mode::Editor(EditorState {
+            card_id: card.id,
+            title: card.title.clone(),
+            body: card.body,
+            field: EditorField::Body,
+            cursor: 0,
+        });
+        if let Mode::Editor(state) = &mut self.mode {
+            state.cursor = state.body.chars().count();
+        }
+        self.status_message =
+            "Full-screen editor — Tab title/body, Ctrl+S saves, Esc cancels.".to_string();
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
@@ -228,8 +266,7 @@ impl App {
                 self.mode = Mode::Board;
                 self.status_message = "Edit cancelled.".to_string();
             }
-            KeyCode::Tab => self.editor_switch_field(),
-            KeyCode::BackTab => self.editor_switch_field(),
+            KeyCode::Tab | KeyCode::BackTab => self.editor_switch_field(),
             KeyCode::Enter => {
                 if self.editor_field() == Some(EditorField::Title) {
                     self.editor_set_field(EditorField::Body);
@@ -254,242 +291,181 @@ impl App {
         }
     }
 
-    fn handle_board_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('q') => self.quit(),
-            KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('h') | KeyCode::Left => self.focus_column(self.focused.saturating_prev()),
-            KeyCode::Char('l') | KeyCode::Right => {
-                self.focus_column(self.focused.saturating_next())
-            }
-            KeyCode::Char('j') | KeyCode::Down => self.select_in_focused(1),
-            KeyCode::Char('k') | KeyCode::Up => self.select_in_focused(-1),
-            KeyCode::Char('n') => self.open_new_card(),
-            KeyCode::Enter => self.open_edit_selected(),
-            KeyCode::Char('d') => self.prompt_delete(),
-            KeyCode::Char('1') => self.move_selected(Column::Backlog),
-            KeyCode::Char('2') => self.move_selected(Column::Running),
-            KeyCode::Char('3') => self.move_selected(Column::Done),
-            KeyCode::Char('r') => self.dispatch_selected(),
-            _ => {}
-        }
-    }
-
-    fn open_new_card(&mut self) {
-        self.mode = Mode::Editor(EditorState {
-            card_id: None,
-            title: String::new(),
-            body: String::new(),
-            field: EditorField::Title,
-            cursor: 0,
-        });
-        self.status_message =
-            "New card — Tab switches fields, Ctrl+S saves, Esc cancels.".to_string();
-    }
-
-    fn open_edit_selected(&mut self) {
-        let Some(card) = self.selected_card().cloned() else {
-            self.status_message = "No card selected. Press n to create one.".to_string();
+    fn commit_editor(&mut self) {
+        let Mode::Editor(state) = &self.mode else {
             return;
         };
-        self.mode = Mode::Editor(EditorState {
-            card_id: Some(card.id),
-            title: card.title,
-            body: card.body,
-            field: EditorField::Title,
-            cursor: 0,
-        });
-        if let Some(ed) = self.editor_state_mut() {
-            ed.cursor = ed.title.chars().count();
+        let id = state.card_id.clone();
+        let title = state.title.trim().to_string();
+        let body = state.body.clone();
+        if title.is_empty() {
+            self.status_message = "Title is required.".to_string();
+            return;
         }
-        self.status_message =
-            "Edit card — Tab switches fields, Ctrl+S saves, Esc cancels.".to_string();
+        if let Some(card) = self.board.get_mut(&id) {
+            card.title = title;
+            card.body = body;
+            card.touch();
+        }
+        self.selected_id = Some(id);
+        self.mode = Mode::Board;
+        self.status_message = "Card updated.".to_string();
+        self.persist();
     }
 
-    fn prompt_delete(&mut self) {
+    fn shift_selected(&mut self, dir: isize) {
+        let Some(id) = self.selected_id.clone() else {
+            self.status_message = "No card selected.".to_string();
+            return;
+        };
+        let Some(card) = self.board.get(&id) else {
+            return;
+        };
+        let next = if dir < 0 {
+            card.status.saturating_left()
+        } else {
+            card.status.saturating_right()
+        };
+        if next == card.status {
+            self.status_message = format!("Already at {}.", card.status.title());
+            return;
+        }
+        self.board.move_card(&id, next);
+        self.status_message = format!("Moved to {}.", next.title());
+        self.persist();
+    }
+
+    fn open_review(&mut self) {
         let Some(card) = self.selected_card() else {
             self.status_message = "No card selected.".to_string();
             return;
         };
-        if self.running_card_id() == Some(card.id.as_str()) {
+        if card.status != Status::Review {
             self.status_message =
-                "Cannot delete a card while its grok run is in progress.".to_string();
+                "r is for Review: accept → Done, or revise → To Do + rev badge.".to_string();
             return;
         }
-        self.mode = Mode::ConfirmDelete {
+        self.mode = Mode::ReviewPick {
             id: card.id.clone(),
             title: card.title.clone(),
         };
     }
 
-    fn delete_card(&mut self, id: &str) {
-        if self.running_card_id() == Some(id) {
-            self.status_message =
-                "Cannot delete a card while its grok run is in progress.".to_string();
-            return;
-        }
-        if self.board.remove_card(id).is_some() {
-            self.status_message = "Card deleted.".to_string();
-            self.ensure_selection();
-            self.persist();
-        }
-    }
-
-    fn move_selected(&mut self, column: Column) {
-        let Some(id) = self.selected_id.clone() else {
-            self.status_message = "No card selected.".to_string();
+    fn handle_review_pick_key(&mut self, key: KeyEvent) {
+        let Mode::ReviewPick { id, .. } = &self.mode else {
             return;
         };
-        if self.board.move_card(&id, column) {
-            self.focused = column;
-            self.status_message = format!("Moved to {}.", column.title());
-            self.persist();
-        }
-    }
-
-    pub fn dispatch_selected(&mut self) {
-        if self.active_run.is_some() {
-            self.status_message =
-                "A run is already in progress. Only one grok -p dispatch at a time.".to_string();
-            return;
-        }
-        let Some(card) = self.selected_card().cloned() else {
-            self.status_message = "No card selected. Press n to create one.".to_string();
-            return;
-        };
-        let prompt = card.prompt();
-        if prompt.trim().is_empty() {
-            self.status_message = "Card has no title or body to send as a grok prompt.".to_string();
-            return;
-        }
-
-        let run_id = dispatch::new_run_id();
-        if let Some(c) = self.board.get_mut(&card.id) {
-            c.column = Column::Running;
-            c.status = CardStatus::Running;
-            c.run_id = Some(run_id.clone());
-            c.last_summary = Some("Dispatching grok -p…".to_string());
-        }
-        self.focused = Column::Running;
-        self.persist();
-
-        let (tx, rx) = mpsc::channel();
-        let card_id = card.id.clone();
-        let run_id_thread = run_id.clone();
-        thread::spawn(move || {
-            let outcome = dispatch::run_headless(&card_id, &prompt, &run_id_thread);
-            let _ = tx.send(outcome);
-        });
-        self.active_run = Some(ActiveRun {
-            card_id: card.id,
-            run_id,
-            started: Instant::now(),
-            rx,
-        });
-        self.status_message = "Started grok -p (headless). Card moved to Running.".to_string();
-    }
-
-    pub fn poll_dispatch(&mut self) {
-        let Some(run) = self.active_run.as_ref() else {
-            return;
-        };
-        match run.rx.try_recv() {
-            Ok(outcome) => {
-                self.active_run = None;
-                self.apply_outcome(outcome);
+        let id = id.clone();
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Board;
+                self.status_message = "Review cancelled.".to_string();
             }
-            Err(TryRecvError::Empty) => {
-                let secs = self.run_elapsed_secs().unwrap_or(0);
-                if let Some(id) = self.running_card_id().map(str::to_string) {
-                    if let Some(card) = self.board.get_mut(&id) {
-                        card.last_summary = Some(format!("running… {secs}s"));
+            KeyCode::Char('a') | KeyCode::Char('A') => self.accept_review(&id),
+            KeyCode::Char('v') | KeyCode::Char('V') => self.start_revise(&id),
+            _ => {}
+        }
+    }
+
+    fn accept_review(&mut self, id: &str) {
+        if let Some(card) = self.board.get_mut(id) {
+            card.status = Status::Done;
+            card.agent_log.push(AgentLogEntry {
+                at: now_iso8601(),
+                kind: "accepted".into(),
+                message: String::new(),
+            });
+            card.touch();
+        }
+        self.selected_id = Some(id.to_string());
+        self.mode = Mode::Board;
+        self.status_message = "Accepted → Done.".to_string();
+        self.persist();
+    }
+
+    fn start_revise(&mut self, id: &str) {
+        self.mode = Mode::Revise(ReviseState {
+            card_id: id.to_string(),
+            comments: String::new(),
+            cursor: 0,
+        });
+        self.status_message =
+            "Revision comments — Ctrl+S sends card to To Do and bumps rev.".to_string();
+    }
+
+    fn handle_revise_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.commit_revise();
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Board;
+                self.status_message = "Revise cancelled.".to_string();
+            }
+            KeyCode::Enter => self.revise_insert('\n'),
+            KeyCode::Backspace => {
+                if let Mode::Revise(state) = &mut self.mode {
+                    if state.cursor > 0 {
+                        remove_char(&mut state.comments, state.cursor - 1);
+                        state.cursor -= 1;
                     }
                 }
             }
-            Err(TryRecvError::Disconnected) => {
-                let card_id = run.card_id.clone();
-                self.active_run = None;
-                self.apply_outcome(DispatchOutcome {
-                    card_id,
-                    run_id: String::new(),
-                    success: false,
-                    summary: "grok worker thread ended unexpectedly.".to_string(),
-                });
+            KeyCode::Delete => {
+                if let Mode::Revise(state) = &mut self.mode {
+                    remove_char(&mut state.comments, state.cursor);
+                }
             }
+            KeyCode::Left => {
+                if let Mode::Revise(state) = &mut self.mode {
+                    state.cursor = state.cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Mode::Revise(state) = &mut self.mode {
+                    state.cursor = (state.cursor + 1).min(state.comments.chars().count());
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.revise_insert(ch);
+            }
+            _ => {}
         }
     }
 
-    pub fn apply_outcome(&mut self, outcome: DispatchOutcome) {
-        let Some(card) = self.board.get_mut(&outcome.card_id) else {
-            self.status_message = "Dispatch finished, but the card was deleted.".to_string();
+    fn revise_insert(&mut self, ch: char) {
+        if let Mode::Revise(state) = &mut self.mode {
+            insert_char(&mut state.comments, state.cursor, ch);
+            state.cursor += 1;
+        }
+    }
+
+    fn commit_revise(&mut self) {
+        let Mode::Revise(state) = &self.mode else {
             return;
         };
-        card.column = Column::Done;
-        card.run_id = if outcome.run_id.is_empty() {
-            card.run_id.clone()
-        } else {
-            Some(outcome.run_id.clone())
-        };
-        if outcome.success {
-            card.status = CardStatus::Success;
-            card.last_summary = Some(outcome.summary);
-            self.status_message = "grok finished successfully → Done (ok).".to_string();
-        } else {
-            card.status = CardStatus::Failed;
-            card.last_summary = Some(outcome.summary);
-            self.status_message = "grok failed → Done (fail).".to_string();
+        let id = state.card_id.clone();
+        let comments = state.comments.trim().to_string();
+        if let Some(card) = self.board.get_mut(&id) {
+            card.status = Status::ToDo;
+            card.revision_count = card.revision_count.saturating_add(1);
+            card.agent_log.push(AgentLogEntry {
+                at: now_iso8601(),
+                kind: "revision".into(),
+                message: comments,
+            });
+            card.touch();
         }
-        self.focused = Column::Done;
-        self.selected_id = Some(outcome.card_id);
+        self.selected_id = Some(id);
+        self.mode = Mode::Board;
+        self.status_message = "Revised → To Do (rev badge updated).".to_string();
         self.persist();
     }
 
     fn quit(&mut self) {
-        if let Some(run) = self.active_run.take() {
-            if let Some(card) = self.board.get_mut(&run.card_id) {
-                card.column = Column::Done;
-                card.status = CardStatus::Failed;
-                card.last_summary =
-                    Some("Run interrupted (quit while grok -p was still running).".to_string());
-            }
-            self.status_message = "Quit during a run — card marked Done (fail).".to_string();
-        }
         self.persist();
         self.should_quit = true;
-    }
-
-    fn commit_editor(&mut self) {
-        let Mode::Editor(state) = &self.mode else {
-            return;
-        };
-        let title = state.title.trim().to_string();
-        let body = state.body.clone();
-        if title.is_empty() && body.trim().is_empty() {
-            self.status_message = "Title or body is required.".to_string();
-            return;
-        }
-        let title = if title.is_empty() {
-            "Untitled".to_string()
-        } else {
-            title
-        };
-
-        if let Some(id) = state.card_id.clone() {
-            if let Some(card) = self.board.get_mut(&id) {
-                card.title = title;
-                card.body = body;
-            }
-            self.selected_id = Some(id);
-            self.status_message = "Card updated.".to_string();
-        } else {
-            let card = Card::new(title, body);
-            self.selected_id = Some(card.id.clone());
-            self.focused = Column::Backlog;
-            self.board.add_card(card);
-            self.status_message = "Card created in Backlog.".to_string();
-        }
-        self.mode = Mode::Board;
-        self.persist();
     }
 
     fn editor_state_mut(&mut self) -> Option<&mut EditorState> {
@@ -555,20 +531,19 @@ impl App {
                 EditorField::Title => state.title.chars().count(),
                 EditorField::Body => state.body.chars().count(),
             } as isize;
-            let next = (state.cursor as isize + delta).clamp(0, len) as usize;
-            state.cursor = next;
+            state.cursor = (state.cursor as isize + delta).clamp(0, len) as usize;
         }
     }
 
     fn editor_insert(&mut self, ch: char) {
         if let Some(state) = self.editor_state_mut() {
+            if state.field == EditorField::Title && ch == '\n' {
+                return;
+            }
             let field = match state.field {
                 EditorField::Title => &mut state.title,
                 EditorField::Body => &mut state.body,
             };
-            if state.field == EditorField::Title && ch == '\n' {
-                return;
-            }
             insert_char(field, state.cursor, ch);
             state.cursor += 1;
         }
@@ -621,118 +596,145 @@ pub fn press(code: KeyCode) -> KeyEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::CardStatus;
-    use std::time::Duration;
 
     fn app_in_tmp() -> (App, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("board.json");
-        let app = App::load_from(&path).unwrap();
+        let app = App::load_from(dir.path().join("board.json")).unwrap();
         (app, dir)
     }
 
-    fn wait_until_idle(app: &mut App) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while app.is_running() && Instant::now() < deadline {
-            app.poll_dispatch();
-            thread::sleep(Duration::from_millis(20));
-        }
-        app.poll_dispatch();
-    }
-
     #[test]
-    fn create_card_via_editor_persists() {
+    fn n_creates_card_in_capture_and_persists() {
         let (mut app, dir) = app_in_tmp();
         app.handle_key(press(KeyCode::Char('n')));
         for ch in "Ship it".chars() {
             app.handle_key(press(KeyCode::Char(ch)));
         }
         app.handle_key(press(KeyCode::Enter));
-        for ch in "Write the README".chars() {
+
+        assert_eq!(app.board.cards.len(), 1);
+        assert_eq!(app.board.cards[0].title, "Ship it");
+        assert_eq!(app.board.cards[0].status, Status::Capture);
+        assert!(app.board.cards[0].body.is_empty());
+
+        let reloaded = persist::load_board(&dir.path().join("board.json")).unwrap();
+        assert_eq!(reloaded.cards[0].title, "Ship it");
+        assert_eq!(reloaded.cards[0].status, Status::Capture);
+    }
+
+    #[test]
+    fn hl_and_arrows_move_card_across_columns() {
+        let (mut app, _dir) = app_in_tmp();
+        app.board.add_card(Card::new("A"));
+        app.selected_id = Some(app.board.cards[0].id.clone());
+
+        app.handle_key(press(KeyCode::Char('l')));
+        assert_eq!(app.board.cards[0].status, Status::ToDo);
+        app.handle_key(press(KeyCode::Right));
+        assert_eq!(app.board.cards[0].status, Status::InProgress);
+        app.handle_key(press(KeyCode::Char('h')));
+        assert_eq!(app.board.cards[0].status, Status::ToDo);
+        app.handle_key(press(KeyCode::Left));
+        assert_eq!(app.board.cards[0].status, Status::Capture);
+        app.handle_key(press(KeyCode::Char('h')));
+        assert_eq!(app.board.cards[0].status, Status::Capture);
+    }
+
+    #[test]
+    fn enter_opens_fullscreen_editor_and_saves_body() {
+        let (mut app, dir) = app_in_tmp();
+        app.board.add_card(Card::new("Title"));
+        app.selected_id = Some(app.board.cards[0].id.clone());
+        app.handle_key(press(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Editor(_)));
+        for ch in "body and context".chars() {
             app.handle_key(press(KeyCode::Char(ch)));
         }
         let mut save = press(KeyCode::Char('s'));
         save.modifiers = KeyModifiers::CONTROL;
         app.handle_key(save);
-
-        assert_eq!(app.board.cards.len(), 1);
-        assert_eq!(app.board.cards[0].title, "Ship it");
-        assert_eq!(app.board.cards[0].body, "Write the README");
-        assert_eq!(app.board.cards[0].column, Column::Backlog);
-
-        let reloaded = persist::load_board(&dir.path().join("board.json")).unwrap();
-        assert_eq!(reloaded.cards.len(), 1);
-        assert_eq!(reloaded.cards[0].title, "Ship it");
+        assert_eq!(app.board.cards[0].body, "body and context");
+        let loaded = persist::load_board(&dir.path().join("board.json")).unwrap();
+        assert_eq!(loaded.cards[0].body, "body and context");
     }
 
     #[test]
-    fn move_keys_change_column() {
+    fn review_accept_goes_to_done() {
         let (mut app, _dir) = app_in_tmp();
-        app.board.add_card(Card::new("A", "b"));
+        let mut card = Card::new("Review me");
+        card.status = Status::Review;
+        app.board.add_card(card);
         app.selected_id = Some(app.board.cards[0].id.clone());
-        app.handle_key(press(KeyCode::Char('3')));
-        assert_eq!(app.board.cards[0].column, Column::Done);
-        app.handle_key(press(KeyCode::Char('1')));
-        assert_eq!(app.board.cards[0].column, Column::Backlog);
+        app.handle_key(press(KeyCode::Char('r')));
+        app.handle_key(press(KeyCode::Char('a')));
+        assert_eq!(app.board.cards[0].status, Status::Done);
+        assert_eq!(app.board.cards[0].revision_count, 0);
     }
 
     #[test]
-    fn dispatch_without_grok_lands_in_done_fail() {
+    fn review_revise_goes_to_todo_and_bumps_rev() {
         let (mut app, _dir) = app_in_tmp();
-        std::env::set_var("AGENT_KANBAN_GROK", "agent-kanban-no-such-grok-binary");
-        app.board.add_card(Card::new("Ask grok", "Say hi."));
+        let mut card = Card::new("Needs work");
+        card.status = Status::Review;
+        app.board.add_card(card);
         app.selected_id = Some(app.board.cards[0].id.clone());
-        app.dispatch_selected();
-        assert_eq!(app.board.cards[0].column, Column::Running);
-        assert_eq!(app.board.cards[0].status, CardStatus::Running);
-        wait_until_idle(&mut app);
-        std::env::remove_var("AGENT_KANBAN_GROK");
-        assert!(!app.is_running());
-        assert_eq!(app.board.cards[0].column, Column::Done);
-        assert_eq!(app.board.cards[0].status, CardStatus::Failed);
-        assert!(app.board.cards[0]
-            .last_summary
-            .as_deref()
-            .unwrap()
-            .contains("not found"));
-    }
-
-    #[test]
-    fn second_dispatch_is_refused() {
-        let (mut app, _dir) = app_in_tmp();
-        app.board.add_card(Card::new("One", "p"));
-        app.board.add_card(Card::new("Two", "p"));
-        let first = app.board.cards[0].id.clone();
-        let second = app.board.cards[1].id.clone();
-        app.selected_id = Some(first);
-        // Inject a pending run so the second dispatch is refused without spawning grok.
-        let (_tx, rx) = mpsc::channel();
-        app.active_run = Some(ActiveRun {
-            card_id: second.clone(),
-            run_id: "hold".into(),
-            started: Instant::now(),
-            rx,
-        });
-        app.selected_id = Some(second);
-        app.dispatch_selected();
-        assert!(app.status_message.contains("already in progress"));
+        app.handle_key(press(KeyCode::Char('r')));
+        app.handle_key(press(KeyCode::Char('v')));
+        for ch in "please add tests".chars() {
+            app.handle_key(press(KeyCode::Char(ch)));
+        }
+        let mut save = press(KeyCode::Char('s'));
+        save.modifiers = KeyModifiers::CONTROL;
+        app.handle_key(save);
+        assert_eq!(app.board.cards[0].status, Status::ToDo);
+        assert_eq!(app.board.cards[0].revision_count, 1);
+        assert_eq!(app.board.cards[0].rev_badge().as_deref(), Some("rev 1"));
         assert_eq!(
-            app.board
-                .cards
-                .iter()
-                .filter(|c| c.status == CardStatus::Running)
-                .count(),
-            0
+            app.board.cards[0].agent_log.last().unwrap().kind,
+            "revision"
+        );
+        assert_eq!(
+            app.board.cards[0].agent_log.last().unwrap().message,
+            "please add tests"
         );
     }
 
     #[test]
-    fn quit_saves_and_sets_flag() {
+    fn r_outside_review_does_not_dispatch() {
+        let (mut app, _dir) = app_in_tmp();
+        app.board.add_card(Card::new("Capture only"));
+        app.selected_id = Some(app.board.cards[0].id.clone());
+        app.handle_key(press(KeyCode::Char('r')));
+        assert_eq!(app.board.cards[0].status, Status::Capture);
+        assert!(app.status_message.contains("Review"));
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn quit_saves() {
         let (mut app, dir) = app_in_tmp();
-        app.board.add_card(Card::new("Keep", "me"));
+        app.board.add_card(Card::new("Keep"));
         app.handle_key(press(KeyCode::Char('q')));
         assert!(app.should_quit);
         let loaded = persist::load_board(&dir.path().join("board.json")).unwrap();
         assert_eq!(loaded.cards[0].title, "Keep");
+    }
+
+    #[test]
+    fn jk_moves_focus_among_cards() {
+        let (mut app, _dir) = app_in_tmp();
+        app.board.add_card(Card::new("One"));
+        app.board.add_card(Card::new("Two"));
+        app.selected_id = Some(app.board.cards[0].id.clone());
+        app.handle_key(press(KeyCode::Char('j')));
+        assert_eq!(
+            app.selected_id.as_deref(),
+            Some(app.board.cards[1].id.as_str())
+        );
+        app.handle_key(press(KeyCode::Char('k')));
+        assert_eq!(
+            app.selected_id.as_deref(),
+            Some(app.board.cards[0].id.as_str())
+        );
     }
 }

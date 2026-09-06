@@ -1,92 +1,75 @@
+use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const BOARD_VERSION: u32 = 1;
 
+/// Column / workflow status. Serialized as `status` on each card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Column {
-    Backlog,
-    Running,
+pub enum Status {
+    Capture,
+    ToDo,
+    InProgress,
+    Review,
     Done,
 }
 
-impl Column {
-    pub const ALL: [Column; 3] = [Column::Backlog, Column::Running, Column::Done];
+impl Status {
+    pub const ALL: [Status; 5] = [
+        Status::Capture,
+        Status::ToDo,
+        Status::InProgress,
+        Status::Review,
+        Status::Done,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
-            Column::Backlog => "Backlog",
-            Column::Running => "Running",
-            Column::Done => "Done",
-        }
-    }
-
-    pub fn from_number(n: u8) -> Option<Self> {
-        match n {
-            1 => Some(Column::Backlog),
-            2 => Some(Column::Running),
-            3 => Some(Column::Done),
-            _ => None,
+            Status::Capture => "Capture",
+            Status::ToDo => "To Do",
+            Status::InProgress => "In Progress",
+            Status::Review => "Review",
+            Status::Done => "Done",
         }
     }
 
     pub fn index(self) -> usize {
         match self {
-            Column::Backlog => 0,
-            Column::Running => 1,
-            Column::Done => 2,
+            Status::Capture => 0,
+            Status::ToDo => 1,
+            Status::InProgress => 2,
+            Status::Review => 3,
+            Status::Done => 4,
         }
     }
 
-    pub fn from_index(i: usize) -> Self {
-        Self::ALL[i % 3]
-    }
-
-    pub fn saturating_prev(self) -> Self {
+    pub fn saturating_left(self) -> Self {
         match self {
-            Column::Backlog => Column::Backlog,
-            Column::Running => Column::Backlog,
-            Column::Done => Column::Running,
+            Status::Capture => Status::Capture,
+            Status::ToDo => Status::Capture,
+            Status::InProgress => Status::ToDo,
+            Status::Review => Status::InProgress,
+            Status::Done => Status::Review,
         }
     }
 
-    pub fn saturating_next(self) -> Self {
+    pub fn saturating_right(self) -> Self {
         match self {
-            Column::Backlog => Column::Running,
-            Column::Running => Column::Done,
-            Column::Done => Column::Done,
+            Status::Capture => Status::ToDo,
+            Status::ToDo => Status::InProgress,
+            Status::InProgress => Status::Review,
+            Status::Review => Status::Done,
+            Status::Done => Status::Done,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CardStatus {
-    Idle,
-    Running,
-    Success,
-    Failed,
-}
-
-impl CardStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            CardStatus::Idle => "idle",
-            CardStatus::Running => "running",
-            CardStatus::Success => "ok",
-            CardStatus::Failed => "fail",
-        }
-    }
-
-    pub fn glyph(self) -> &'static str {
-        match self {
-            CardStatus::Idle => "·",
-            CardStatus::Running => "●",
-            CardStatus::Success => "✓",
-            CardStatus::Failed => "✗",
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLogEntry {
+    pub at: String,
+    pub kind: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,48 +77,40 @@ pub struct Card {
     pub id: String,
     pub title: String,
     pub body: String,
-    pub column: Column,
-    pub status: CardStatus,
+    pub status: Status,
     #[serde(default)]
-    pub last_summary: Option<String>,
+    pub revision_count: u32,
     #[serde(default)]
-    pub run_id: Option<String>,
+    pub agent_log: Vec<AgentLogEntry>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 impl Card {
-    pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
+    pub fn new(title: impl Into<String>) -> Self {
+        let now = now_iso8601();
         Self {
             id: Uuid::new_v4().to_string(),
             title: title.into(),
-            body: body.into(),
-            column: Column::Backlog,
-            status: CardStatus::Idle,
-            last_summary: None,
-            run_id: None,
+            body: String::new(),
+            status: Status::Capture,
+            revision_count: 0,
+            agent_log: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now,
         }
     }
 
-    pub fn prompt(&self) -> String {
-        let title = self.title.trim();
-        let body = self.body.trim();
-        match (title.is_empty(), body.is_empty()) {
-            (true, true) => String::new(),
-            (false, true) => title.to_string(),
-            (true, false) => body.to_string(),
-            (false, false) => format!("{title}\n\n{body}"),
-        }
+    pub fn touch(&mut self) {
+        self.updated_at = now_iso8601();
     }
 
-    pub fn summary_preview(&self, max_chars: usize) -> String {
-        let Some(summary) = self.last_summary.as_deref() else {
-            return String::new();
-        };
-        let line = summary
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("");
-        truncate_chars(line, max_chars)
+    pub fn rev_badge(&self) -> Option<String> {
+        if self.revision_count > 0 {
+            Some(format!("rev {}", self.revision_count))
+        } else {
+            None
+        }
     }
 }
 
@@ -155,8 +130,8 @@ impl Default for Board {
 }
 
 impl Board {
-    pub fn cards_in(&self, column: Column) -> Vec<&Card> {
-        self.cards.iter().filter(|c| c.column == column).collect()
+    pub fn cards_in(&self, status: Status) -> Vec<&Card> {
+        self.cards.iter().filter(|c| c.status == status).collect()
     }
 
     pub fn get(&self, id: &str) -> Option<&Card> {
@@ -176,34 +151,30 @@ impl Board {
         Some(self.cards.remove(idx))
     }
 
-    pub fn move_card(&mut self, id: &str, column: Column) -> bool {
+    pub fn move_card(&mut self, id: &str, status: Status) -> bool {
         if let Some(card) = self.get_mut(id) {
-            card.column = column;
+            if card.status != status {
+                card.status = status;
+                card.touch();
+            }
             true
         } else {
             false
         }
     }
 
-    /// Cards left in a live Running state (e.g. after a crash or quit) land in
-    /// Done with a fail status so they never stay stuck in Running.
-    pub fn recover_interrupted_runs(&mut self) -> usize {
-        let mut recovered = 0;
-        for card in &mut self.cards {
-            if card.status == CardStatus::Running {
-                card.column = Column::Done;
-                card.status = CardStatus::Failed;
-                card.last_summary = Some(
-                    card.last_summary
-                        .clone()
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or_else(|| "Run interrupted (app quit or crashed).".to_string()),
-                );
-                recovered += 1;
-            }
+    /// Cards in column-major order (Capture top-to-bottom, then To Do, …).
+    pub fn cards_in_board_order(&self) -> Vec<&Card> {
+        let mut out = Vec::with_capacity(self.cards.len());
+        for status in Status::ALL {
+            out.extend(self.cards_in(status));
         }
-        recovered
+        out
     }
+}
+
+pub fn now_iso8601() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 pub fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -218,54 +189,45 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     out
 }
 
-pub fn summarize_output(text: &str, max_chars: usize) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return "(no output)".to_string();
-    }
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
-    }
-    truncate_chars(trimmed, max_chars)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn prompt_joins_title_and_body() {
-        let card = Card::new("Fix login", "Check the session cookie.");
-        assert_eq!(card.prompt(), "Fix login\n\nCheck the session cookie.");
+    fn new_card_lands_in_capture() {
+        let card = Card::new("Inbox item");
+        assert_eq!(card.status, Status::Capture);
+        assert_eq!(card.revision_count, 0);
+        assert!(card.agent_log.is_empty());
+        assert!(card.rev_badge().is_none());
+        assert!(!card.created_at.is_empty());
     }
 
     #[test]
-    fn recover_moves_running_cards_to_done_fail() {
-        let mut board = Board::default();
-        let mut card = Card::new("Work", "do it");
-        card.column = Column::Running;
-        card.status = CardStatus::Running;
-        board.add_card(card);
-        assert_eq!(board.recover_interrupted_runs(), 1);
-        let card = &board.cards[0];
-        assert_eq!(card.column, Column::Done);
-        assert_eq!(card.status, CardStatus::Failed);
-        assert!(card
-            .last_summary
-            .as_deref()
-            .unwrap()
-            .contains("interrupted"));
+    fn rev_badge_only_when_revised() {
+        let mut card = Card::new("Work");
+        assert!(card.rev_badge().is_none());
+        card.revision_count = 2;
+        assert_eq!(card.rev_badge().as_deref(), Some("rev 2"));
     }
 
     #[test]
-    fn recover_leaves_idle_running_column_alone() {
+    fn move_updates_status_and_timestamp() {
         let mut board = Board::default();
-        let mut card = Card::new("Parked", "");
-        card.column = Column::Running;
-        card.status = CardStatus::Idle;
+        let card = Card::new("A");
+        let id = card.id.clone();
+        let created = card.updated_at.clone();
         board.add_card(card);
-        assert_eq!(board.recover_interrupted_runs(), 0);
-        assert_eq!(board.cards[0].column, Column::Running);
-        assert_eq!(board.cards[0].status, CardStatus::Idle);
+        assert!(board.move_card(&id, Status::ToDo));
+        assert_eq!(board.get(&id).unwrap().status, Status::ToDo);
+        assert!(board.get(&id).unwrap().updated_at >= created);
+    }
+
+    #[test]
+    fn saturating_edges() {
+        assert_eq!(Status::Capture.saturating_left(), Status::Capture);
+        assert_eq!(Status::Done.saturating_right(), Status::Done);
+        assert_eq!(Status::Capture.saturating_right(), Status::ToDo);
+        assert_eq!(Status::Review.saturating_left(), Status::InProgress);
     }
 }
