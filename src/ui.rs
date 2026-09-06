@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, EditorField, EditorState, InlineTitle, Mode, ReviseState};
+use crate::app::{App, EditorField, EditorState, InlineTitle, Mode};
 use crate::model::{Card, Status};
 
 const TITLE_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
@@ -16,19 +16,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
             draw_fullscreen_editor(frame, area, app, state);
             return;
         }
-        Mode::Revise(state) => {
-            draw_board_chrome(frame, area, app);
-            draw_revise(frame, area, state);
-            return;
-        }
         _ => draw_board_chrome(frame, area, app),
     }
 
     match &app.mode {
         Mode::Help => draw_help(frame, area),
         Mode::InlineTitle(state) => draw_inline_title(frame, area, state),
-        Mode::ReviewPick { title, .. } => draw_review_pick(frame, area, title),
-        Mode::Board | Mode::Editor(_) | Mode::Revise(_) => {}
+        Mode::Board | Mode::Editor(_) => {}
     }
 }
 
@@ -80,7 +74,7 @@ fn draw_columns(frame: &mut Frame, area: Rect, app: &App) {
 fn column_color(status: Status) -> Color {
     match status {
         Status::Capture => Color::Cyan,
-        Status::ToDo => Color::Blue,
+        Status::Todo => Color::Blue,
         Status::InProgress => Color::Yellow,
         Status::Review => Color::Magenta,
         Status::Done => Color::Green,
@@ -97,7 +91,7 @@ fn column_border_style(status: Status, focused: bool) -> Style {
 }
 
 fn draw_column(frame: &mut Frame, area: Rect, app: &App, status: Status) {
-    let focused = app.focused_status() == Some(status);
+    let focused = app.focused == status;
     let cards = app.board.cards_in(status);
     let title = format!(
         " {} {} ({}) ",
@@ -164,7 +158,7 @@ fn card_lines(card: &Card, selected: bool, width: u16) -> Vec<Line<'static>> {
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    let col = app.focused_status().map(Status::title).unwrap_or("—");
+    let col = app.focused.title();
     let msg = if app.status_message.is_empty() {
         "press ? for keys".to_string()
     } else {
@@ -182,7 +176,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect) {
-    let hints = " j/k focus  h/l move  n capture  Enter edit  r review  ? help  q quit ";
+    let hints = " j/k select  h/l move  n capture  Enter edit  ? help  q quit ";
     frame.render_widget(
         Paragraph::new(hints)
             .style(Style::new().fg(Color::DarkGray))
@@ -210,16 +204,15 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  j / ↓ , k / ↑          move focus among cards"),
+        Line::from("  j / ↓ , k / ↑          select card in the focused column"),
         Line::from("  h / ←                  move focused card one column left"),
         Line::from("  l / →                  move focused card one column right"),
         Line::from("  n                      inline title → new card in Capture"),
-        Line::from("  Enter                  full-screen editor (body / context)"),
-        Line::from("  r                      Review only: accept → Done, or revise"),
-        Line::from("  q                      quit (auto-save)"),
+        Line::from("  Enter                  full-screen body editor"),
+        Line::from("  q                      quit (auto-save ./board.json)"),
         Line::from("  ?                      this help"),
         Line::from(""),
-        Line::from("  No agent runner in M1. Cards persist to one JSON file."),
+        Line::from("  M1 is the board shell only. No agent. Persist: ./board.json"),
         Line::from("  Esc or ? closes this overlay."),
     ];
     frame.render_widget(
@@ -256,55 +249,6 @@ fn draw_inline_title(frame: &mut Frame, area: Rect, state: &InlineTitle) {
                 .border_style(Style::new().fg(Color::Cyan)),
         ),
         popup,
-    );
-}
-
-fn draw_review_pick(frame: &mut Frame, area: Rect, title: &str) {
-    let popup = centered(area, 58, 9);
-    frame.render_widget(Clear, popup);
-    let text = vec![
-        Line::from(""),
-        Line::from(format!("  Review “{}”", title)),
-        Line::from(""),
-        Line::from("  a  accept  →  Done"),
-        Line::from("  v  revise  →  edit comments, then To Do + rev++"),
-        Line::from("  Esc cancel"),
-    ];
-    frame.render_widget(
-        Paragraph::new(text).block(
-            Block::default()
-                .title(" Review ")
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(Color::Magenta)),
-        ),
-        popup,
-    );
-}
-
-fn draw_revise(frame: &mut Frame, area: Rect, state: &ReviseState) {
-    let popup = centered(area, area.width.min(72), 12);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(with_cursor(&state.comments, state.cursor, true))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Revision comments ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::new().fg(Color::Magenta)),
-            ),
-        popup,
-    );
-    let hint = Rect {
-        x: popup.x,
-        y: popup.y.saturating_add(popup.height.saturating_sub(1)),
-        width: popup.width,
-        height: 1,
-    };
-    frame.render_widget(
-        Paragraph::new(" Ctrl+S → To Do + bump rev   Esc cancel ")
-            .style(Style::new().fg(Color::DarkGray)),
-        hint,
     );
 }
 
@@ -452,10 +396,12 @@ mod tests {
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("new card in Capture"));
-        assert!(text.contains("one column"));
+        assert!(text.contains("select card in the focused column"));
+        assert!(text.contains("./board.json"));
         assert!(text.contains("quit"));
         assert!(!text.contains("grok"));
-        assert!(!text.contains("dispatch"));
+        assert!(!text.contains("accept"));
+        assert!(!text.contains("revise"));
     }
 
     #[test]

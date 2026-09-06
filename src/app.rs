@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::model::{now_iso8601, AgentLogEntry, Board, Card, Status};
+use crate::model::{Board, Card, Status};
 use crate::persist;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,25 +28,17 @@ pub struct InlineTitle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviseState {
-    pub card_id: String,
-    pub comments: String,
-    pub cursor: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Board,
     Help,
     InlineTitle(InlineTitle),
     Editor(EditorState),
-    ReviewPick { id: String, title: String },
-    Revise(ReviseState),
 }
 
 pub struct App {
     pub board: Board,
     pub board_path: PathBuf,
+    pub focused: Status,
     pub selected_id: Option<String>,
     pub mode: Mode,
     pub status_message: String,
@@ -61,10 +53,20 @@ impl App {
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let board = persist::load_board(&path)?;
+        let selected_id = match board.cards_in(Status::Capture).first() {
+            Some(c) => Some(c.id.clone()),
+            None => board.cards_in_board_order().first().map(|c| c.id.clone()),
+        };
+        let focused = selected_id
+            .as_deref()
+            .and_then(|id| board.get(id))
+            .map(|c| c.status)
+            .unwrap_or(Status::Capture);
         let mut app = Self {
-            selected_id: board.cards.first().map(|c| c.id.clone()),
+            selected_id,
             board,
             board_path: path,
+            focused,
             mode: Mode::Board,
             status_message: String::new(),
             should_quit: false,
@@ -89,27 +91,36 @@ impl App {
             .and_then(|id| self.board.get(id))
     }
 
-    pub fn focused_status(&self) -> Option<Status> {
-        self.selected_card().map(|c| c.status)
-    }
-
     fn ensure_selection(&mut self) {
         if let Some(id) = &self.selected_id {
-            if self.board.get(id).is_some() {
+            if let Some(card) = self.board.get(id) {
+                self.focused = card.status;
                 return;
             }
         }
-        self.selected_id = self
+        let in_col: Vec<String> = self
             .board
-            .cards_in_board_order()
-            .first()
-            .map(|c| c.id.clone());
+            .cards_in(self.focused)
+            .into_iter()
+            .map(|c| c.id.clone())
+            .collect();
+        self.selected_id = in_col.first().cloned().or_else(|| {
+            self.board
+                .cards_in_board_order()
+                .first()
+                .map(|c| c.id.clone())
+        });
+        if let Some(id) = &self.selected_id {
+            if let Some(card) = self.board.get(id) {
+                self.focused = card.status;
+            }
+        }
     }
 
-    fn select_delta(&mut self, delta: isize) {
+    fn select_in_column(&mut self, delta: isize) {
         let ids: Vec<String> = self
             .board
-            .cards_in_board_order()
+            .cards_in(self.focused)
             .into_iter()
             .map(|c| c.id.clone())
             .collect();
@@ -143,8 +154,6 @@ impl App {
             Mode::Help => self.handle_help_key(key),
             Mode::InlineTitle(_) => self.handle_inline_title_key(key),
             Mode::Editor(_) => self.handle_editor_key(key),
-            Mode::ReviewPick { .. } => self.handle_review_pick_key(key),
-            Mode::Revise(_) => self.handle_revise_key(key),
             Mode::Board => self.handle_board_key(key),
         }
     }
@@ -161,13 +170,12 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.quit(),
             KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('j') | KeyCode::Down => self.select_delta(1),
-            KeyCode::Char('k') | KeyCode::Up => self.select_delta(-1),
+            KeyCode::Char('j') | KeyCode::Down => self.select_in_column(1),
+            KeyCode::Char('k') | KeyCode::Up => self.select_in_column(-1),
             KeyCode::Char('h') | KeyCode::Left => self.shift_selected(-1),
             KeyCode::Char('l') | KeyCode::Right => self.shift_selected(1),
             KeyCode::Char('n') => self.start_inline_title(),
             KeyCode::Enter => self.open_editor(),
-            KeyCode::Char('r') => self.open_review(),
             _ => {}
         }
     }
@@ -231,6 +239,7 @@ impl App {
         }
         let card = Card::new(title);
         self.selected_id = Some(card.id.clone());
+        self.focused = Status::Capture;
         self.board.add_card(card);
         self.mode = Mode::Board;
         self.status_message = "Card created in Capture.".to_string();
@@ -331,135 +340,8 @@ impl App {
             return;
         }
         self.board.move_card(&id, next);
+        self.focused = next;
         self.status_message = format!("Moved to {}.", next.title());
-        self.persist();
-    }
-
-    fn open_review(&mut self) {
-        let Some(card) = self.selected_card() else {
-            self.status_message = "No card selected.".to_string();
-            return;
-        };
-        if card.status != Status::Review {
-            self.status_message =
-                "r is for Review: accept → Done, or revise → To Do + rev badge.".to_string();
-            return;
-        }
-        self.mode = Mode::ReviewPick {
-            id: card.id.clone(),
-            title: card.title.clone(),
-        };
-    }
-
-    fn handle_review_pick_key(&mut self, key: KeyEvent) {
-        let Mode::ReviewPick { id, .. } = &self.mode else {
-            return;
-        };
-        let id = id.clone();
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Board;
-                self.status_message = "Review cancelled.".to_string();
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') => self.accept_review(&id),
-            KeyCode::Char('v') | KeyCode::Char('V') => self.start_revise(&id),
-            _ => {}
-        }
-    }
-
-    fn accept_review(&mut self, id: &str) {
-        if let Some(card) = self.board.get_mut(id) {
-            card.status = Status::Done;
-            card.agent_log.push(AgentLogEntry {
-                at: now_iso8601(),
-                kind: "accepted".into(),
-                message: String::new(),
-            });
-            card.touch();
-        }
-        self.selected_id = Some(id.to_string());
-        self.mode = Mode::Board;
-        self.status_message = "Accepted → Done.".to_string();
-        self.persist();
-    }
-
-    fn start_revise(&mut self, id: &str) {
-        self.mode = Mode::Revise(ReviseState {
-            card_id: id.to_string(),
-            comments: String::new(),
-            cursor: 0,
-        });
-        self.status_message =
-            "Revision comments — Ctrl+S sends card to To Do and bumps rev.".to_string();
-    }
-
-    fn handle_revise_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            self.commit_revise();
-            return;
-        }
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Board;
-                self.status_message = "Revise cancelled.".to_string();
-            }
-            KeyCode::Enter => self.revise_insert('\n'),
-            KeyCode::Backspace => {
-                if let Mode::Revise(state) = &mut self.mode {
-                    if state.cursor > 0 {
-                        remove_char(&mut state.comments, state.cursor - 1);
-                        state.cursor -= 1;
-                    }
-                }
-            }
-            KeyCode::Delete => {
-                if let Mode::Revise(state) = &mut self.mode {
-                    remove_char(&mut state.comments, state.cursor);
-                }
-            }
-            KeyCode::Left => {
-                if let Mode::Revise(state) = &mut self.mode {
-                    state.cursor = state.cursor.saturating_sub(1);
-                }
-            }
-            KeyCode::Right => {
-                if let Mode::Revise(state) = &mut self.mode {
-                    state.cursor = (state.cursor + 1).min(state.comments.chars().count());
-                }
-            }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.revise_insert(ch);
-            }
-            _ => {}
-        }
-    }
-
-    fn revise_insert(&mut self, ch: char) {
-        if let Mode::Revise(state) = &mut self.mode {
-            insert_char(&mut state.comments, state.cursor, ch);
-            state.cursor += 1;
-        }
-    }
-
-    fn commit_revise(&mut self) {
-        let Mode::Revise(state) = &self.mode else {
-            return;
-        };
-        let id = state.card_id.clone();
-        let comments = state.comments.trim().to_string();
-        if let Some(card) = self.board.get_mut(&id) {
-            card.status = Status::ToDo;
-            card.revision_count = card.revision_count.saturating_add(1);
-            card.agent_log.push(AgentLogEntry {
-                at: now_iso8601(),
-                kind: "revision".into(),
-                message: comments,
-            });
-            card.touch();
-        }
-        self.selected_id = Some(id);
-        self.mode = Mode::Board;
-        self.status_message = "Revised → To Do (rev badge updated).".to_string();
         self.persist();
     }
 
@@ -629,11 +511,11 @@ mod tests {
         app.selected_id = Some(app.board.cards[0].id.clone());
 
         app.handle_key(press(KeyCode::Char('l')));
-        assert_eq!(app.board.cards[0].status, Status::ToDo);
+        assert_eq!(app.board.cards[0].status, Status::Todo);
         app.handle_key(press(KeyCode::Right));
         assert_eq!(app.board.cards[0].status, Status::InProgress);
         app.handle_key(press(KeyCode::Char('h')));
-        assert_eq!(app.board.cards[0].status, Status::ToDo);
+        assert_eq!(app.board.cards[0].status, Status::Todo);
         app.handle_key(press(KeyCode::Left));
         assert_eq!(app.board.cards[0].status, Status::Capture);
         app.handle_key(press(KeyCode::Char('h')));
@@ -659,54 +541,16 @@ mod tests {
     }
 
     #[test]
-    fn review_accept_goes_to_done() {
+    fn r_does_not_run_review_or_agent() {
         let (mut app, _dir) = app_in_tmp();
-        let mut card = Card::new("Review me");
+        let mut card = Card::new("In review");
         card.status = Status::Review;
         app.board.add_card(card);
         app.selected_id = Some(app.board.cards[0].id.clone());
+        app.focused = Status::Review;
         app.handle_key(press(KeyCode::Char('r')));
-        app.handle_key(press(KeyCode::Char('a')));
-        assert_eq!(app.board.cards[0].status, Status::Done);
+        assert_eq!(app.board.cards[0].status, Status::Review);
         assert_eq!(app.board.cards[0].revision_count, 0);
-    }
-
-    #[test]
-    fn review_revise_goes_to_todo_and_bumps_rev() {
-        let (mut app, _dir) = app_in_tmp();
-        let mut card = Card::new("Needs work");
-        card.status = Status::Review;
-        app.board.add_card(card);
-        app.selected_id = Some(app.board.cards[0].id.clone());
-        app.handle_key(press(KeyCode::Char('r')));
-        app.handle_key(press(KeyCode::Char('v')));
-        for ch in "please add tests".chars() {
-            app.handle_key(press(KeyCode::Char(ch)));
-        }
-        let mut save = press(KeyCode::Char('s'));
-        save.modifiers = KeyModifiers::CONTROL;
-        app.handle_key(save);
-        assert_eq!(app.board.cards[0].status, Status::ToDo);
-        assert_eq!(app.board.cards[0].revision_count, 1);
-        assert_eq!(app.board.cards[0].rev_badge().as_deref(), Some("rev 1"));
-        assert_eq!(
-            app.board.cards[0].agent_log.last().unwrap().kind,
-            "revision"
-        );
-        assert_eq!(
-            app.board.cards[0].agent_log.last().unwrap().message,
-            "please add tests"
-        );
-    }
-
-    #[test]
-    fn r_outside_review_does_not_dispatch() {
-        let (mut app, _dir) = app_in_tmp();
-        app.board.add_card(Card::new("Capture only"));
-        app.selected_id = Some(app.board.cards[0].id.clone());
-        app.handle_key(press(KeyCode::Char('r')));
-        assert_eq!(app.board.cards[0].status, Status::Capture);
-        assert!(app.status_message.contains("Review"));
         assert!(matches!(app.mode, Mode::Board));
     }
 
@@ -721,15 +565,25 @@ mod tests {
     }
 
     #[test]
-    fn jk_moves_focus_among_cards() {
+    fn jk_selects_only_within_column() {
         let (mut app, _dir) = app_in_tmp();
         app.board.add_card(Card::new("One"));
         app.board.add_card(Card::new("Two"));
+        let mut other = Card::new("Other col");
+        other.status = Status::Done;
+        app.board.add_card(other);
+        app.focused = Status::Capture;
         app.selected_id = Some(app.board.cards[0].id.clone());
         app.handle_key(press(KeyCode::Char('j')));
         assert_eq!(
             app.selected_id.as_deref(),
             Some(app.board.cards[1].id.as_str())
+        );
+        app.handle_key(press(KeyCode::Char('j')));
+        assert_eq!(
+            app.selected_id.as_deref(),
+            Some(app.board.cards[1].id.as_str()),
+            "j must stay in Capture, not jump to Done"
         );
         app.handle_key(press(KeyCode::Char('k')));
         assert_eq!(

@@ -2,14 +2,12 @@ use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const BOARD_VERSION: u32 = 1;
-
-/// Column / workflow status. Serialized as `status` on each card.
+/// Column / workflow status. Serialized as `capture` | `todo` | `in_progress` | `review` | `done`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Capture,
-    ToDo,
+    Todo,
     InProgress,
     Review,
     Done,
@@ -18,7 +16,7 @@ pub enum Status {
 impl Status {
     pub const ALL: [Status; 5] = [
         Status::Capture,
-        Status::ToDo,
+        Status::Todo,
         Status::InProgress,
         Status::Review,
         Status::Done,
@@ -27,28 +25,18 @@ impl Status {
     pub fn title(self) -> &'static str {
         match self {
             Status::Capture => "Capture",
-            Status::ToDo => "To Do",
+            Status::Todo => "To Do",
             Status::InProgress => "In Progress",
             Status::Review => "Review",
             Status::Done => "Done",
         }
     }
 
-    pub fn index(self) -> usize {
-        match self {
-            Status::Capture => 0,
-            Status::ToDo => 1,
-            Status::InProgress => 2,
-            Status::Review => 3,
-            Status::Done => 4,
-        }
-    }
-
     pub fn saturating_left(self) -> Self {
         match self {
             Status::Capture => Status::Capture,
-            Status::ToDo => Status::Capture,
-            Status::InProgress => Status::ToDo,
+            Status::Todo => Status::Capture,
+            Status::InProgress => Status::Todo,
             Status::Review => Status::InProgress,
             Status::Done => Status::Review,
         }
@@ -56,8 +44,8 @@ impl Status {
 
     pub fn saturating_right(self) -> Self {
         match self {
-            Status::Capture => Status::ToDo,
-            Status::ToDo => Status::InProgress,
+            Status::Capture => Status::Todo,
+            Status::Todo => Status::InProgress,
             Status::InProgress => Status::Review,
             Status::Review => Status::Done,
             Status::Done => Status::Done,
@@ -114,19 +102,9 @@ impl Card {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Board {
-    pub version: u32,
     pub cards: Vec<Card>,
-}
-
-impl Default for Board {
-    fn default() -> Self {
-        Self {
-            version: BOARD_VERSION,
-            cards: Vec::new(),
-        }
-    }
 }
 
 impl Board {
@@ -218,16 +196,34 @@ mod tests {
         let id = card.id.clone();
         let created = card.updated_at.clone();
         board.add_card(card);
-        assert!(board.move_card(&id, Status::ToDo));
-        assert_eq!(board.get(&id).unwrap().status, Status::ToDo);
+        assert!(board.move_card(&id, Status::Todo));
+        assert_eq!(board.get(&id).unwrap().status, Status::Todo);
         assert!(board.get(&id).unwrap().updated_at >= created);
+    }
+
+    #[test]
+    fn status_json_matches_product_enum() {
+        assert_eq!(
+            serde_json::to_string(&Status::Capture).unwrap(),
+            "\"capture\""
+        );
+        assert_eq!(serde_json::to_string(&Status::Todo).unwrap(), "\"todo\"");
+        assert_eq!(
+            serde_json::to_string(&Status::InProgress).unwrap(),
+            "\"in_progress\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Status::Review).unwrap(),
+            "\"review\""
+        );
+        assert_eq!(serde_json::to_string(&Status::Done).unwrap(), "\"done\"");
     }
 
     #[test]
     fn saturating_edges() {
         assert_eq!(Status::Capture.saturating_left(), Status::Capture);
         assert_eq!(Status::Done.saturating_right(), Status::Done);
-        assert_eq!(Status::Capture.saturating_right(), Status::ToDo);
+        assert_eq!(Status::Capture.saturating_right(), Status::Todo);
         assert_eq!(Status::Review.saturating_left(), Status::InProgress);
     }
 }

@@ -1,4 +1,6 @@
 /target
+/board.json
+board.json
 **/*.rs.bk
 .idea
 .vscode
