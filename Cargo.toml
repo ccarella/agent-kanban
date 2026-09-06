@@ -1,0 +1,20 @@
+[package]
+name = "agent-kanban"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Terminal Kanban board (M1 board shell — no agent dispatch)"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+crossterm = "0.28"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
