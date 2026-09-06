@@ -71,21 +71,14 @@ impl App {
             dirty: false,
             active_run: None,
         };
-        if app
-            .board
-            .cards
-            .iter()
-            .any(|c| c.status == CardStatus::Failed)
-        {
-            // Recovery already applied in load_board; surface it once.
-            if app.board.cards.iter().any(|c| {
-                c.status == CardStatus::Failed
-                    && c.last_summary
-                        .as_deref()
-                        .is_some_and(|s| s.contains("interrupted"))
-            }) {
-                app.status_message = "Recovered interrupted run(s) → Done (fail).".to_string();
-            }
+        // Recovery already applied in load_board; surface it once.
+        if app.board.cards.iter().any(|c| {
+            c.status == CardStatus::Failed
+                && c.last_summary
+                    .as_deref()
+                    .is_some_and(|s| s.contains("interrupted"))
+        }) {
+            app.status_message = "Recovered interrupted run(s) → Done (fail).".to_string();
         }
         app.ensure_selection();
         Ok(app)
