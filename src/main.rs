@@ -32,6 +32,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 _ => {}
             }
         }
+        app.on_tick();
     }
     Ok(())
 }
